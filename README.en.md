@@ -42,7 +42,21 @@ clawhub install inkos          # Install from ClawHub
 
 If you installed via npm or cloned the repo, `skills/SKILL.md` is already included — 🦞 can read it directly without a separate ClawHub install.
 
-Once installed, Claw can invoke InkOS atomic commands and control-surface operations (`plan chapter`/`compose chapter`/`draft`/`audit`/`revise`/`write next`) via `exec`, with `--json` output for structured decision-making. The recommended flow is: update `author_intent.md` or `current_focus.md`, run `plan` / `compose`, then decide whether to call `draft` or the full `write next` pipeline. You can also browse it on [ClawHub](https://clawhub.ai) by searching `inkos`.
+Once installed, Claw should prefer the shared interaction entry:
+
+```bash
+inkos interact --json --message "continue the current book, but keep the pacing tighter"
+```
+
+This routes through the same conversation executor used by the project TUI, so OpenClaw, TUI, and Studio stay on the same control brain. The JSON payload includes:
+- parsed request
+- assistant response text
+- updated interaction session
+- execution state
+- pending decision
+- recent events
+
+Atomic commands (`plan chapter` / `compose chapter` / `draft` / `audit` / `revise` / `write next`) are still available, but they are now lower-level tools rather than the preferred OpenClaw entry. You can also browse it on [ClawHub](https://clawhub.ai) by searching `inkos`.
 
 ### Configure
 
@@ -102,19 +116,18 @@ inkos config show-models        # View current routing
 
 Agents without explicit overrides fall back to the global model.
 
-### v1 Update
+### v1.2 Update
 
-**InkOS Studio + Writing Pipeline Overhaul**
+**Unified Interaction Kernel + TUI Dashboard + Studio Assistant**
 
-- **InkOS Studio** (v1.0): `inkos studio` launches a local web workbench (Vite + React + Hono). Book management, chapter review & editing, real-time writing progress, market radar, analytics, AI detection, style analysis, genre management, daemon control, truth file editing — everything the CLI does, now visual
-- **Foundation Reviewer** (v1.1): independent review agent at book creation, 5-dimension scoring (canon DNA, new narrative space, core conflict, opening pacing, pacing viability), auto-reject below 80
-- **Hook Seed Excerpt** (v1.1): when resolving hooks, Composer extracts original seed scene excerpts into Writer context so payoff scenes are grounded in concrete narrative
-- **Review Reject Rollback** (v1.1): `inkos review reject` rolls back state to the pre-chapter snapshot, discards downstream chapters and memory index
-- **State Validation Recovery** (v1.1): auto-retries settler on state validation failure, degrades gracefully if still failing, `inkos write repair-state` for manual recovery
-- **Bilingual Import** (v1.1.1): `import chapters` and `fanfic init` support bilingual prompts, auto-detect continuation vs series mode
-- **Chapter Number Anchoring** (v1.1): chapter progress anchored to contiguous durable files only — narrative numbers no longer pollute progress
-- Audit drift isolation, title collapse repair, hook budget hints, chapter ending trail, mood/pacing monotony detection
-- Bilingual AI-tells and sensitive word lists, custom HTTP headers (`INKOS_LLM_HEADERS`)
+- **Shared Interaction Runtime**: TUI, Studio, `inkos interact`, and OpenClaw Skill share a single NL understanding + execution kernel, supporting 15+ intents (write, revise, rewrite, rename, export, switch book, etc.)
+- **Ink TUI Dashboard**: `inkos` launches a full-screen interactive dashboard (Ink + React) with conversational creation, slash command autocomplete, themed animations, and bilingual i18n
+- **Studio Assistant Panel**: right-side AI assistant panel connects to the shared interaction kernel — natural language book operations (rename, write, audit, export) with real-time execution status
+- **Conversational Book Creation**: brainstorm book settings through natural language dialogue, one-click create when draft is ready
+- **Book-wide Entity Rename**: `rename Lin Jin to Zhang San` or `/rename Lin Jin => Zhang San` — scans all chapters + truth files in one pass
+- **`inkos interact`**: shared interaction JSON endpoint for OpenClaw / external agent integration
+- **Thinking Model Temperature Clamp**: kimi-k2.5 and similar thinking models auto-clamped to temperature=1, compatible with per-call temperature overrides
+- **Studio Dead Code Cleanup**: removed unused shadcn components and dependencies, -2800 lines
 
 ### Write Your First Book
 
