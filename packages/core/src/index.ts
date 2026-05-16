@@ -269,6 +269,13 @@ export {
 } from "./llm/service-presets.js";
 export { resolveServiceModel, type ResolvedModel } from "./llm/service-resolver.js";
 export { loadSecrets, saveSecrets, getServiceApiKey, type SecretsFile } from "./llm/secrets.js";
+export {
+  COVER_PROVIDER_PRESETS,
+  coverSecretKey,
+  resolveCoverProviderPreset,
+  type CoverProviderId,
+  type CoverProviderPreset,
+} from "./llm/cover-providers.js";
 export { migrateConfig, type MigrationResult } from "./llm/config-migration.js";
 export { getAllEndpoints, getEndpoint, type InkosEndpoint, type InkosModel, type EndpointGroup } from "./llm/providers/index.js";
 export { probeModelsFromUpstream, type ProbedModel } from "./llm/providers/probe.js";

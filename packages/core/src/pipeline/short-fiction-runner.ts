@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { AgentContext } from "../agents/base.js";
 import {
@@ -22,6 +22,8 @@ import {
   type ShortHitReference,
   type ShortHitSalesPackage,
 } from "../agents/short-hit.js";
+import { coverSecretKey, resolveCoverProviderPreset, type CoverProviderPreset } from "../llm/cover-providers.js";
+import { loadSecrets } from "../llm/secrets.js";
 import { safeChildPath } from "../utils/path-safety.js";
 
 export interface ShortFictionRunRuntimes {
@@ -252,20 +254,32 @@ async function generateCoverArtifact(input: {
   readonly coverSize?: string;
   readonly coverApiKeyEnv?: string;
 }): Promise<{ readonly coverImagePath: string }> {
-  const endpoint = resolveCoverEndpoint(input.coverEndpoint, input.coverBaseUrl);
-  const model = input.coverModel || process.env.INKOS_COVER_MODEL || "gpt-5.5";
+  const request = await resolveCoverGenerationRequest({
+    root: input.root,
+    coverBaseUrl: input.coverBaseUrl,
+    coverEndpoint: input.coverEndpoint,
+    coverModel: input.coverModel,
+    coverApiKeyEnv: input.coverApiKeyEnv,
+  });
   const size = input.coverSize || process.env.INKOS_COVER_SIZE || "1024x1360";
-  const apiKeyEnv = input.coverApiKeyEnv || "INKOS_COVER_API_KEY";
-  const apiKey = resolveCoverApiKey(apiKeyEnv);
 
+  if (request.api === "gemini") {
+    const prompt = buildCoverImagePrompt(input.salesPackage);
+    const payload = await generateGeminiCover(request, prompt);
+    const coverPath = join(input.baseDir, "final", payload.extension === "jpg" ? "cover.jpg" : "cover.png");
+    await writeBinary(input.root, coverPath, Buffer.from(payload.base64, "base64"));
+    return { coverImagePath: coverPath };
+  }
+
+  const endpoint = request.endpoint ?? `${request.baseUrl.replace(/\/+$/u, "")}/responses`;
   const response = await fetch(endpoint, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
+      Authorization: `Bearer ${request.apiKey}`,
     },
     body: JSON.stringify({
-      model,
+      model: request.model,
       input: buildCoverImagePrompt(input.salesPackage),
       tools: [{ type: "image_generation", size }],
     }),
@@ -292,6 +306,112 @@ async function generateCoverArtifact(input: {
   return { coverImagePath: coverPath };
 }
 
+export interface ShortFictionCoverRequest {
+  readonly api: CoverProviderPreset["api"];
+  readonly baseUrl: string;
+  readonly endpoint?: string;
+  readonly model: string;
+  readonly apiKey: string;
+}
+
+export async function resolveCoverGenerationRequest(input: {
+  readonly root: string;
+  readonly coverBaseUrl?: string;
+  readonly coverEndpoint?: string;
+  readonly coverModel?: string;
+  readonly coverApiKeyEnv?: string;
+}): Promise<ShortFictionCoverRequest> {
+  if (input.coverEndpoint || input.coverBaseUrl || process.env.INKOS_COVER_ENDPOINT || process.env.INKOS_COVER_BASE_URL) {
+    const endpoint = resolveCoverEndpoint(input.coverEndpoint, input.coverBaseUrl);
+    const baseUrl = input.coverBaseUrl || process.env.INKOS_COVER_BASE_URL || endpoint.replace(/\/responses\/?$/u, "");
+    return {
+      api: "responses",
+      baseUrl,
+      endpoint,
+      model: input.coverModel || process.env.INKOS_COVER_MODEL || "gpt-5.5",
+      apiKey: resolveCoverApiKey(input.coverApiKeyEnv || "INKOS_COVER_API_KEY"),
+    };
+  }
+
+  const projectCover = await readProjectCoverConfig(input.root);
+  if (!projectCover) {
+    throw new Error("cover endpoint is required. Configure cover generation in Studio or set INKOS_COVER_BASE_URL.");
+  }
+
+  const preset = resolveCoverProviderPreset(projectCover.service);
+  if (!preset) {
+    throw new Error(`Unsupported cover service: ${projectCover.service}`);
+  }
+  const apiKey = await resolveProjectCoverApiKey(input.root, projectCover.service);
+  if (!apiKey) {
+    throw new Error(`Cover API key is required. Configure a cover key for ${preset.label}.`);
+  }
+
+  return {
+    api: preset.api,
+    baseUrl: preset.baseUrl,
+    model: input.coverModel || projectCover.model || preset.defaultModel,
+    apiKey,
+  };
+}
+
+async function readProjectCoverConfig(root: string): Promise<{ readonly service: string; readonly model?: string } | undefined> {
+  try {
+    const raw = await readFile(join(root, "inkos.json"), "utf-8");
+    const parsed = JSON.parse(raw) as { llm?: { cover?: { service?: unknown; model?: unknown } } };
+    const service = typeof parsed.llm?.cover?.service === "string" ? parsed.llm.cover.service : "";
+    if (!service) return undefined;
+    return {
+      service,
+      ...(typeof parsed.llm?.cover?.model === "string" && parsed.llm.cover.model.trim()
+        ? { model: parsed.llm.cover.model.trim() }
+        : {}),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+async function resolveProjectCoverApiKey(root: string, service: string): Promise<string> {
+  const secrets = await loadSecrets(root);
+  return secrets.services[coverSecretKey(service)]?.apiKey
+    || secrets.services[service]?.apiKey
+    || process.env[`${service.replace(/[^a-zA-Z0-9]/g, "_").toUpperCase()}_API_KEY`]
+    || "";
+}
+
+async function generateGeminiCover(
+  request: ShortFictionCoverRequest,
+  prompt: string,
+): Promise<{ readonly base64: string; readonly extension: "png" | "jpg" }> {
+  const endpoint = `${request.baseUrl.replace(/\/+$/u, "")}/models/${encodeURIComponent(request.model)}:generateContent?key=${encodeURIComponent(request.apiKey)}`;
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      generationConfig: { responseModalities: ["IMAGE", "TEXT"] },
+    }),
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`cover generation failed: HTTP ${response.status} ${text.slice(0, 500)}`);
+  }
+
+  let payload: unknown;
+  try {
+    payload = JSON.parse(text);
+  } catch (error) {
+    throw new Error(`cover generation returned non-JSON response: ${String(error)}`);
+  }
+
+  const image = extractGeminiImageBase64(payload);
+  if (!image) {
+    throw new Error("cover generation response did not include Gemini inline image data.");
+  }
+  return image;
+}
+
 export function extractResponsesImageBase64(payload: unknown): string | undefined {
   const output = (payload as { output?: unknown }).output;
   if (!Array.isArray(output)) return undefined;
@@ -307,6 +427,29 @@ export function extractResponsesImageBase64(payload: unknown): string | undefine
         if (typeof contentRecord.result === "string" && contentRecord.result.trim()) return contentRecord.result.trim();
         if (typeof contentRecord.image_base64 === "string" && contentRecord.image_base64.trim()) return contentRecord.image_base64.trim();
       }
+    }
+  }
+
+  return undefined;
+}
+
+export function extractGeminiImageBase64(payload: unknown): { readonly base64: string; readonly extension: "png" | "jpg" } | undefined {
+  const candidates = (payload as { candidates?: unknown }).candidates;
+  if (!Array.isArray(candidates)) return undefined;
+
+  for (const candidate of candidates) {
+    const parts = (candidate as { content?: { parts?: unknown } }).content?.parts;
+    if (!Array.isArray(parts)) continue;
+    for (const part of parts) {
+      const inlineData = (part as { inlineData?: unknown; inline_data?: unknown }).inlineData
+        ?? (part as { inlineData?: unknown; inline_data?: unknown }).inline_data;
+      const record = inlineData as { data?: unknown; mimeType?: unknown; mime_type?: unknown } | undefined;
+      if (typeof record?.data !== "string" || !record.data.trim()) continue;
+      const mimeType = String(record.mimeType ?? record.mime_type ?? "image/png").toLowerCase();
+      return {
+        base64: record.data.trim(),
+        extension: mimeType.includes("jpeg") || mimeType.includes("jpg") ? "jpg" : "png",
+      };
     }
   }
 

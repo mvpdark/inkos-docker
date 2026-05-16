@@ -233,6 +233,9 @@ vi.mock("@actalk/inkos-core", async (importOriginal) => {
     resolveServiceProviderFamily: resolveServiceProviderFamilyMock,
     resolveServiceModelsBaseUrl: resolveServiceModelsBaseUrlMock,
     resolveServiceModel: resolveServiceModelMock,
+    COVER_PROVIDER_PRESETS: actual.COVER_PROVIDER_PRESETS,
+    coverSecretKey: actual.coverSecretKey,
+    resolveCoverProviderPreset: actual.resolveCoverProviderPreset,
     isApiKeyOptionalForEndpoint: actual.isApiKeyOptionalForEndpoint,
     loadSecrets: loadSecretsMock,
     saveSecrets: saveSecretsMock,
@@ -1912,6 +1915,41 @@ describe("createStudioServer daemon lifecycle", () => {
       error: expect.stringContaining("API Key"),
     });
     expect(saveSecretsMock).not.toHaveBeenCalled();
+  });
+
+  it("saves cover generation config and a separate cover API key", async () => {
+    loadSecretsMock.mockResolvedValue({ services: {} });
+
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const saveConfig = await app.request("http://localhost/api/v1/cover/config", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        service: "kkaiapi",
+        model: "gpt-5.5",
+      }),
+    });
+    expect(saveConfig.status).toBe(200);
+
+    const raw = JSON.parse(await readFile(join(root, "inkos.json"), "utf-8"));
+    expect(raw.llm.cover).toEqual({
+      service: "kkaiapi",
+      model: "gpt-5.5",
+    });
+
+    const saveSecret = await app.request("http://localhost/api/v1/cover/secret/kkaiapi", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ apiKey: "sk-cover" }),
+    });
+    expect(saveSecret.status).toBe(200);
+    expect(saveSecretsMock).toHaveBeenCalledWith(root, {
+      services: {
+        "cover:kkaiapi": { apiKey: "sk-cover" },
+      },
+    });
   });
 
   it("rejects create requests when a complete book with the same id already exists", async () => {

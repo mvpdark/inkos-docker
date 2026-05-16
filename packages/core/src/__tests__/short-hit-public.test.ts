@@ -1,10 +1,18 @@
 import { describe, expect, it, vi } from "vitest";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { LLMClient } from "../llm/provider.js";
 import {
   ShortHitDraftReviserAgent,
   parseShortHitBatchDraft,
   validateShortHitDraftForFinal,
 } from "../agents/short-hit.js";
+import { saveSecrets } from "../llm/secrets.js";
+import {
+  extractGeminiImageBase64,
+  resolveCoverGenerationRequest,
+} from "../pipeline/short-fiction-runner.js";
 
 const ZERO_USAGE = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
 
@@ -120,5 +128,60 @@ describe("public short-hit chain", () => {
     expect(revised.storyTitle).toBe("新稿标题");
 
     chatSpy.mockRestore();
+  });
+
+  it("resolves cover generation from project cover config and stored cover secret", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-short-cover-"));
+    try {
+      await writeFile(join(root, "inkos.json"), JSON.stringify({
+        name: "cover-test",
+        version: "0.1.0",
+        language: "zh",
+        llm: {
+          provider: "openai",
+          service: "kkaiapi",
+          configSource: "studio",
+          baseUrl: "https://api.kkaiapi.com/v1",
+          apiKey: "",
+          model: "deepseek-v4-flash",
+          cover: {
+            service: "kkaiapi",
+            model: "gpt-5.5",
+          },
+        },
+        notify: [],
+      }, null, 2), "utf-8");
+      await saveSecrets(root, {
+        services: {
+          "cover:kkaiapi": { apiKey: "sk-cover" },
+        },
+      });
+
+      await expect(resolveCoverGenerationRequest({ root })).resolves.toMatchObject({
+        api: "responses",
+        baseUrl: "https://api.kkaiapi.com/v1",
+        model: "gpt-5.5",
+        apiKey: "sk-cover",
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("extracts Gemini inline image data from generateContent responses", () => {
+    const image = extractGeminiImageBase64({
+      candidates: [
+        {
+          content: {
+            parts: [
+              { text: "ok" },
+              { inlineData: { mimeType: "image/jpeg", data: "ZmFrZQ==" } },
+            ],
+          },
+        },
+      ],
+    });
+
+    expect(image).toEqual({ base64: "ZmFrZQ==", extension: "jpg" });
   });
 });
