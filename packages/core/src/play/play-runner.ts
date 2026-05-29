@@ -39,6 +39,7 @@ export interface PlaySceneRendererLike {
     readonly action: PlayActionIntentInput;
     readonly mutationSummary: string;
     readonly stateBrief: string;
+    readonly mode?: "open" | "guided";
   }) => Promise<PlaySceneRender>;
 }
 
@@ -121,11 +122,13 @@ export class PlayRunner {
       blocked: mutation.blocked,
     });
 
+    const world = await this.store.loadWorld(this.options.worldId);
     const render = await this.sceneRenderer.render({
       input: rawInput,
       action,
       mutationSummary: mutation.summary || mutation.blockedReason,
       stateBrief,
+      mode: world?.mode ?? "open",
     });
     await this.store.writeProjection(this.options.worldId, this.options.runId, "projections/scene.md", `${render.sceneText}\n`);
     await this.store.appendTranscriptTurn(this.options.worldId, this.options.runId, {

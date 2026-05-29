@@ -79,9 +79,9 @@ export class PlaySceneRendererAgent extends BaseAgent {
     return "play-scene-renderer";
   }
 
-  async render(input: PlaySceneRenderInput): Promise<PlaySceneRender> {
+  async render(input: PlaySceneRenderInput & { readonly mode?: "open" | "guided" }): Promise<PlaySceneRender> {
     const response = await this.chat([
-      { role: "system", content: buildSceneRendererSystemPrompt() },
+      { role: "system", content: buildSceneRendererSystemPrompt(input.mode ?? "open") },
       { role: "user", content: buildSceneRendererUserPrompt(input) },
     ], { temperature: 0.45, maxTokens: 2048 });
     return PlaySceneRenderSchema.parse(parseJson(response.content));
@@ -140,14 +140,16 @@ function buildWorldMutatorUserPrompt(input: PlayWorldMutatorInput): string {
   ].join("\n");
 }
 
-function buildSceneRendererSystemPrompt(): string {
-  return [
+export function buildSceneRendererSystemPrompt(mode: "open" | "guided" = "open"): string {
+  const base = [
     "你是互动小说场景回应作者。",
     "你只能根据已经应用后的状态写回应，不要推翻 reducer 结果。",
     "回应要像可玩的小说：有动作、感官、压迫、选择余地；不要写成系统日志。",
-    "建议动作给 2-4 个，短句即可；开放模式下建议动作只是参考，不限制玩家输入。",
-    "输出严格 JSON：sceneText, suggestedActions。",
-  ].join("\n");
+  ];
+  const actionsRule = mode === "guided"
+    ? "这是选项式玩法：suggestedActions 必须给 2-4 个，每回合都要给，是玩家唯一的前进方式；每个选项是一句可直接执行的具体行动。"
+    : "建议动作给 2-4 个，短句即可；开放模式下建议动作只是参考，不限制玩家输入。";
+  return [...base, actionsRule, "输出严格 JSON：sceneText, suggestedActions。"].join("\n");
 }
 
 function buildSceneRendererUserPrompt(input: PlaySceneRenderInput): string {

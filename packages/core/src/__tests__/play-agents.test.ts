@@ -3,6 +3,7 @@ import {
   PlayActionInterpreterAgent,
   PlaySceneRendererAgent,
   PlayWorldMutatorAgent,
+  buildSceneRendererSystemPrompt,
 } from "../play/play-agents.js";
 
 const ctx = {
@@ -65,5 +66,18 @@ describe("play agents", () => {
       sceneText: expect.stringContaining("车机屏幕"),
       suggestedActions: ["继续翻看医院记录", "套徐晋安的话"],
     });
+  });
+});
+
+describe("scene renderer prompt by mode", () => {
+  it("guided 模式要求每回合给 2-4 个选项", () => {
+    const prompt = buildSceneRendererSystemPrompt("guided");
+    expect(prompt).toContain("2-4");
+    expect(prompt).toMatch(/必须|每回合/);
+  });
+
+  it("open 模式不强制选项数量", () => {
+    const prompt = buildSceneRendererSystemPrompt("open");
+    expect(prompt).not.toContain("必须给 2-4");
   });
 });
