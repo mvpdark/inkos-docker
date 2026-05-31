@@ -775,6 +775,30 @@ describe("runAgentSession cache — bookId switch", () => {
     expect(body).toContain("书A 的真相");
   });
 
+  it("非 Google 的 openai-completions 端点也把 toolResult 折叠成 user 文本(避免上游 503)", async () => {
+    const model = {
+      provider: "openai",
+      id: "deepseek-v4-pro",
+      api: "openai-completions",
+      baseUrl: "https://api.kkaiapi.com/v1",
+      input: ["text"],
+    } as any;
+    const pipeline = {} as any;
+
+    await runAgentSession(
+      { sessionId: "s1", bookId: "book-a", language: "zh", pipeline, projectRoot, model },
+      "use tool",
+    );
+
+    const lastContextMessages = streamCalls.at(-1)?.context.messages ?? [];
+    expect(lastContextMessages.some((message: any) => message.role === "toolResult")).toBe(false);
+    expect(lastContextMessages).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ role: "user", content: expect.stringContaining("[Tool results]") }),
+      ]),
+    );
+  });
+
   it("Gemini OpenAI-compatible 从历史恢复时使用状态摘要而不是 toolResult bridge", async () => {
     const model = {
       provider: "google",

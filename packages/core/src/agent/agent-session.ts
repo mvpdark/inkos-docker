@@ -364,12 +364,13 @@ function convertAgentMessagesForModel(messages: AgentMessage[], model: Model<Api
   });
 
   const candidate = model as { api?: unknown; baseUrl?: unknown };
-  const isGoogleOpenAICompatible = (
-    candidate.api === "openai-completions" &&
-    typeof candidate.baseUrl === "string" &&
-    candidate.baseUrl.includes("generativelanguage.googleapis.com")
-  );
-  if (!isGoogleOpenAICompatible) return llmMessages;
+  // InkOS's internal `toolResult` role is not part of the OpenAI Chat Completions spec.
+  // Many openai-completions upstreams (Google, and kkaiapi/DeepSeek-Pro-style gateways) reject
+  // it outright — which surfaces as an opaque "503 provider temporarily unavailable" — so fold
+  // tool results into a plain user message for EVERY openai-completions endpoint, not just Google.
+  // Anthropic-format endpoints (MiniMax / 百炼) handle tool results natively and are left untouched.
+  const isOpenAICompletionsCompatible = candidate.api === "openai-completions";
+  if (!isOpenAICompletionsCompatible) return llmMessages;
 
   const converted: Message[] = [];
   const pushToolResultsAsUser = (toolResults: ToolResultMessage[]) => {
