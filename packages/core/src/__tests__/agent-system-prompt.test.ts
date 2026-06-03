@@ -51,7 +51,7 @@ describe("buildAgentSystemPrompt", () => {
       expect(prompt).toContain("确认是否创建");
       expect(prompt).toContain("分阶段");
       expect(prompt).toContain("世界观与规则");
-      expect(prompt).toContain("结构与约束");
+      expect(prompt).toContain("人称/比例/禁忌/节奏要求");
       expect(prompt).toContain("propose_action");
       expect(prompt).toContain("create_book");
       expect(prompt).not.toContain("sub_agent");
@@ -96,7 +96,7 @@ describe("buildAgentSystemPrompt", () => {
       expect(prompt).toContain("propose_action");
       expect(prompt).toContain("short_run");
       expect(prompt).toContain("generate_cover");
-      expect(prompt).toContain("先确认方案");
+      expect(prompt).toContain("让用户确认");
       expect(prompt).not.toContain("short_fiction_run");
       expect(prompt).not.toContain("sub_agent");
       expect(prompt).not.toContain("architect");
@@ -120,7 +120,7 @@ describe("buildAgentSystemPrompt", () => {
         requestedIntent: "generate_cover",
       });
       expect(prompt).toContain("generate_cover");
-      expect(prompt).toContain("不重跑正文");
+      expect(prompt).toContain("不要重跑正文");
       expect(prompt).not.toContain("short_fiction_run");
       expect(prompt).not.toContain("sub_agent");
       expect(prompt).not.toContain("play_start");
@@ -137,12 +137,24 @@ describe("buildAgentSystemPrompt", () => {
   });
 
   describe("play mode", () => {
-    it("gates new world start behind a confirmation proposal but keeps play_step", () => {
-      const prompt = buildAgentSystemPrompt(null, "zh", "play");
+    it("gates new world start behind a confirmation proposal before a world exists", () => {
+      const prompt = buildAgentSystemPrompt(null, "zh", "play", { playWorldExists: false });
       expect(prompt).toContain("InkOS Play 助手");
       expect(prompt).toContain("propose_action");
       expect(prompt).toContain("play_start");
+      expect(prompt).not.toContain("play_step：");
+      expect(prompt).not.toContain("short_fiction_run");
+      expect(prompt).not.toContain("generate_cover");
+      expect(prompt).not.toContain("sub_agent");
+      expect(prompt).not.toContain("architect");
+    });
+
+    it("exposes play_step only after a world exists", () => {
+      const prompt = buildAgentSystemPrompt(null, "zh", "play", { playWorldExists: true });
+      expect(prompt).toContain("InkOS Play 助手");
       expect(prompt).toContain("play_step");
+      expect(prompt).not.toContain("propose_action");
+      expect(prompt).not.toContain("play_start：");
       expect(prompt).not.toContain("short_fiction_run");
       expect(prompt).not.toContain("generate_cover");
       expect(prompt).not.toContain("sub_agent");
@@ -232,8 +244,8 @@ describe("buildAgentSystemPrompt", () => {
     });
 
     it("forbids claiming side effects without successful tool execution", () => {
-      expect(buildAgentSystemPrompt(null, "zh", "chat")).toContain("不要声称已经创建、写入、修改或生成任何文件");
-      expect(buildAgentSystemPrompt(null, "en", "chat")).toContain("Do not claim that anything was created");
+      expect(buildAgentSystemPrompt(null, "zh", "chat")).toContain("不要虚报工具执行结果");
+      expect(buildAgentSystemPrompt(null, "en", "chat")).toContain("do not claim side effects without successful tool results");
     });
   });
 });

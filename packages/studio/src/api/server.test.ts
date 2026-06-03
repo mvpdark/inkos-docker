@@ -270,6 +270,10 @@ vi.mock("@actalk/inkos-core", async (importOriginal) => {
     fetchWithProxy: vi.fn((input: Parameters<typeof fetch>[0], init?: RequestInit) => fetch(input, init)),
     GLOBAL_ENV_PATH: join(tmpdir(), "inkos-global.env"),
     SessionKindSchema: actual.SessionKindSchema,
+    isWriteNextInstruction: actual.isWriteNextInstruction,
+    normalizeActionSource: actual.normalizeActionSource,
+    normalizePlayMode: actual.normalizePlayMode,
+    normalizeRequestedIntent: actual.normalizeRequestedIntent,
   };
 });
 

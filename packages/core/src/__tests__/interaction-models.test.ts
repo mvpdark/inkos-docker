@@ -1,13 +1,20 @@
 import { describe, expect, it } from "vitest";
 import {
   AutomationModeSchema,
+  ActionSourceSchema,
   BookCreationDraftSchema,
   InteractionIntentTypeSchema,
   ExecutionStatusSchema,
   InteractionSessionSchema,
+  PlayModeSchema,
+  RequestedIntentSchema,
   bindActiveBook,
   clearPendingDecision,
   isTerminalExecutionStatus,
+  isWriteNextInstruction,
+  normalizeActionSource,
+  normalizePlayMode,
+  normalizeRequestedIntent,
   appendInteractionMessage,
   appendInteractionEvent,
   updateCreationDraft,
@@ -29,6 +36,29 @@ describe("interaction models", () => {
     expect(InteractionIntentTypeSchema.parse("write_next")).toBe("write_next");
     expect(InteractionIntentTypeSchema.parse("rewrite_chapter")).toBe("rewrite_chapter");
     expect(InteractionIntentTypeSchema.parse("explain_failure")).toBe("explain_failure");
+  });
+
+  it("parses Studio/agent action envelope fields from one shared schema", () => {
+    expect(ActionSourceSchema.parse("free-text")).toBe("free-text");
+    expect(ActionSourceSchema.parse("button")).toBe("button");
+    expect(RequestedIntentSchema.parse("create_book")).toBe("create_book");
+    expect(RequestedIntentSchema.parse("play_start")).toBe("play_start");
+    expect(PlayModeSchema.parse("guided")).toBe("guided");
+
+    expect(normalizeActionSource(undefined)).toBe("free-text");
+    expect(normalizeActionSource("slash")).toBe("slash");
+    expect(normalizeRequestedIntent("short_run")).toBe("short_run");
+    expect(normalizeRequestedIntent("")).toBeUndefined();
+    expect(normalizePlayMode("open")).toBe("open");
+    expect(normalizePlayMode(null)).toBeUndefined();
+  });
+
+  it("uses one write-next detector across Studio and TUI entrypoints", () => {
+    expect(isWriteNextInstruction("继续写")).toBe(true);
+    expect(isWriteNextInstruction("write next")).toBe(true);
+    expect(isWriteNextInstruction("/write")).toBe(false);
+    expect(isWriteNextInstruction("/write", { allowSlashWrite: true })).toBe(true);
+    expect(isWriteNextInstruction("我们讨论一下要不要继续写")).toBe(false);
   });
 
   it("recognizes terminal execution statuses", () => {

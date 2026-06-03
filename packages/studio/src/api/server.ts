@@ -52,12 +52,19 @@ import {
   coverSecretKey,
   resolveCoverProviderPreset,
   SessionKindSchema,
+  isWriteNextInstruction,
+  normalizeActionSource as normalizeCoreActionSource,
+  normalizePlayMode as normalizeCorePlayMode,
+  normalizeRequestedIntent as normalizeCoreRequestedIntent,
   inferLanguage,
+  type ActionSource,
   type ResolvedModel,
   type PipelineConfig,
+  type PlayMode,
   type ProjectConfig,
   type LogSink,
   type LogEntry,
+  type RequestedIntent,
   type SessionKind,
 } from "@actalk/inkos-core";
 import { access, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
@@ -261,34 +268,7 @@ function hasSuccessfulToolExec(
   );
 }
 
-function isWriteNextInstruction(instruction: string): boolean {
-  const trimmed = instruction.trim();
-  return /^(continue|继续|继续写|写下一章|write next|下一章|再来一章)$/i.test(trimmed);
-}
-
-type StudioSessionKind = SessionKind;
-type StudioActionSource = "free-text" | "button" | "slash" | "quick-action";
-type StudioRequestedIntent =
-  | "create_book"
-  | "write_next"
-  | "short_run"
-  | "play_start"
-  | "play_step"
-  | "generate_cover"
-  | "edit_artifact";
-
-const STUDIO_ACTION_SOURCES = new Set<StudioActionSource>(["free-text", "button", "slash", "quick-action"]);
-const STUDIO_REQUESTED_INTENTS = new Set<StudioRequestedIntent>([
-  "create_book",
-  "write_next",
-  "short_run",
-  "play_start",
-  "play_step",
-  "generate_cover",
-  "edit_artifact",
-]);
-
-function normalizeStudioSessionKind(value: unknown, fallback: StudioSessionKind): StudioSessionKind {
+function normalizeStudioSessionKind(value: unknown, fallback: SessionKind): SessionKind {
   if (value === undefined || value === null || value === "") return fallback;
   const parsed = SessionKindSchema.safeParse(value);
   if (!parsed.success) {
@@ -297,36 +277,36 @@ function normalizeStudioSessionKind(value: unknown, fallback: StudioSessionKind)
   return parsed.data;
 }
 
-function normalizeStudioActionSource(value: unknown): StudioActionSource {
-  if (value === undefined || value === null || value === "") return "free-text";
-  if (typeof value !== "string" || !STUDIO_ACTION_SOURCES.has(value as StudioActionSource)) {
+function normalizeStudioActionSource(value: unknown): ActionSource {
+  try {
+    return normalizeCoreActionSource(value);
+  } catch {
     throw new ApiError(400, "INVALID_ACTION_SOURCE", `Invalid actionSource: ${String(value)}`);
   }
-  return value as StudioActionSource;
 }
 
-function normalizeStudioRequestedIntent(value: unknown): StudioRequestedIntent | undefined {
-  if (value === undefined || value === null || value === "") return undefined;
-  if (typeof value !== "string" || !STUDIO_REQUESTED_INTENTS.has(value as StudioRequestedIntent)) {
+function normalizeStudioRequestedIntent(value: unknown): RequestedIntent | undefined {
+  try {
+    return normalizeCoreRequestedIntent(value);
+  } catch {
     throw new ApiError(400, "INVALID_REQUESTED_INTENT", `Invalid requestedIntent: ${String(value)}`);
   }
-  return value as StudioRequestedIntent;
 }
 
-function normalizeStudioPlayMode(value: unknown): "open" | "guided" | undefined {
-  if (value === undefined || value === null || value === "") return undefined;
-  if (value !== "open" && value !== "guided") {
+function normalizeStudioPlayMode(value: unknown): PlayMode | undefined {
+  try {
+    return normalizeCorePlayMode(value);
+  } catch {
     throw new ApiError(400, "INVALID_PLAY_MODE", `Invalid playMode: ${String(value)}`);
   }
-  return value;
 }
 
 function shouldRunDirectWriteNext(args: {
   readonly instruction: string;
   readonly agentBookId: string | null | undefined;
-  readonly sessionKind: StudioSessionKind;
-  readonly actionSource: StudioActionSource;
-  readonly requestedIntent?: StudioRequestedIntent;
+  readonly sessionKind: SessionKind;
+  readonly actionSource: ActionSource;
+  readonly requestedIntent?: RequestedIntent;
 }): boolean {
   if (!args.agentBookId || args.sessionKind !== "book") return false;
   if (args.requestedIntent === "write_next") return true;
@@ -547,16 +527,10 @@ async function tryHandleExternalChatEdit(params: {
   };
 }
 
-function looksLikeBookCreatedClaim(responseText: string): boolean {
-  return /(?:已|已经|成功).{0,12}(?:创建|建书|初始化|保存).{0,12}(?:作品|书|书籍|文件夹)?/.test(responseText)
-    || /\b(?:created|initiali[sz]ed|saved)\b.{0,40}\b(?:book|project|novel)\b/i.test(responseText);
-}
-
 function validateAgentActionExecution(args: {
   readonly instruction: string;
   readonly agentBookId: string | null | undefined;
-  readonly requestedIntent?: StudioRequestedIntent;
-  readonly responseText: string;
+  readonly requestedIntent?: RequestedIntent;
   readonly collectedToolExecs: ReadonlyArray<CollectedToolExec>;
 }): string | undefined {
   const failedExec = args.collectedToolExecs.find(isLikelyFailedToolResult);
@@ -590,14 +564,6 @@ function validateAgentActionExecution(args: {
 
   if (args.requestedIntent === "generate_cover" && !hasSuccessfulToolExec(args.collectedToolExecs, "generate_cover")) {
     return "已确认生成封面，但模型没有实际调用封面工具。请重试；如果仍失败，请检查模型是否支持工具调用。";
-  }
-
-  if (
-    !args.agentBookId
-    && looksLikeBookCreatedClaim(args.responseText)
-    && !resolveCreatedBookIdFromToolExecs(args.collectedToolExecs)
-  ) {
-    return "模型声称已创建作品，但没有实际调用建书工具，也没有生成作品文件。请补充书名/题材后重试，或换用支持工具调用的模型。";
   }
 
   return undefined;
@@ -3179,7 +3145,6 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
           instruction,
           agentBookId,
           requestedIntent,
-          responseText: result.responseText,
           collectedToolExecs,
         });
         if (actionExecutionError) {
@@ -3254,7 +3219,6 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
               instruction,
               agentBookId,
               requestedIntent,
-              responseText: fallback.content,
               collectedToolExecs,
             });
             if (actionExecutionError) {

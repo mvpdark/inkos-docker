@@ -2,6 +2,7 @@ import {
   appendInteractionMessage,
   clearPendingDecision,
   createLLMClient,
+  isWriteNextInstruction,
   runAgentSession,
   type InteractionSession,
 } from "@actalk/inkos-core";
@@ -70,7 +71,7 @@ export async function processTuiAgentInput(params: {
     }
   }
 
-  if (resolvedBookId && isWriteNextInstruction(params.input)) {
+  if (resolvedBookId && isWriteNextInstruction(params.input, { allowSlashWrite: true })) {
     const writeResult = await pipeline.writeNextChapter(resolvedBookId);
     const chapterNumber = getResultNumber(writeResult, "chapterNumber");
     const title = getResultString(writeResult, "title");
@@ -164,11 +165,6 @@ export async function processTuiAgentInput(params: {
     responseText: result.responseText,
     session: nextSession,
   };
-}
-
-function isWriteNextInstruction(instruction: string): boolean {
-  const trimmed = instruction.trim();
-  return /^(\/write|continue|继续|继续写|写下一章|write next|下一章|再来一章)$/i.test(trimmed);
 }
 
 function isCreateBookInstruction(instruction: string): boolean {

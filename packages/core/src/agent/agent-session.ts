@@ -42,7 +42,8 @@ import {
   restoreAgentMessagesFromTranscript,
 } from "../interaction/session-transcript-restore.js";
 import type { TranscriptEvent, TranscriptRole } from "../interaction/session-transcript-schema.js";
-import type { SessionKind } from "../interaction/session.js";
+import type { PlayMode, SessionKind } from "../interaction/session.js";
+import type { ActionSource, RequestedIntent } from "../interaction/action-envelope.js";
 import { assertSafeBookId } from "../utils/book-id.js";
 import { PlayStore } from "../play/play-store.js";
 
@@ -58,18 +59,11 @@ export interface AgentSessionConfig {
   /** Studio conversation surface. Used to narrow the visible tools. */
   sessionKind?: SessionKind;
   /** Play interaction mode chosen by the player at launch (guided = choice-only, open = free text). */
-  playMode?: "open" | "guided";
+  playMode?: PlayMode;
   /** Where this turn came from. Button/slash turns can execute confirmed production actions. */
-  actionSource?: "free-text" | "button" | "slash" | "quick-action";
+  actionSource?: ActionSource;
   /** Explicit user-confirmed action requested by the UI/command surface. */
-  requestedIntent?:
-    | "create_book"
-    | "write_next"
-    | "short_run"
-    | "play_start"
-    | "play_step"
-    | "generate_cover"
-    | "edit_artifact";
+  requestedIntent?: RequestedIntent;
   /** Language for the system prompt. */
   language: string;
   /** PipelineRunner for sub-agent tool delegation. */
@@ -707,7 +701,7 @@ async function runAgentSessionUnlocked(
     const agent = new Agent({
       initialState: {
         model,
-        systemPrompt: buildAgentSystemPrompt(bookId, language, sessionKind, { actionSource, requestedIntent }),
+        systemPrompt: buildAgentSystemPrompt(bookId, language, sessionKind, { actionSource, requestedIntent, playWorldExists }),
         tools: createAgentToolsForMode({
           pipeline,
           bookId,

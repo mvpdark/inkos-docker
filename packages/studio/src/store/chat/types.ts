@@ -1,4 +1,4 @@
-import type { SessionKind } from "@actalk/inkos-core";
+import type { ActionSource, PlayMode, RequestedIntent, SessionKind } from "@actalk/inkos-core";
 
 // -- Data types --
 
@@ -113,16 +113,8 @@ export interface BookSummary {
 }
 
 export type ChatSessionKind = SessionKind;
-export type PlayMode = "open" | "guided";
-export type ChatActionSource = "free-text" | "button" | "slash" | "quick-action";
-export type ChatRequestedIntent =
-  | "create_book"
-  | "write_next"
-  | "short_run"
-  | "play_start"
-  | "play_step"
-  | "generate_cover"
-  | "edit_artifact";
+export type ChatActionSource = ActionSource;
+export type ChatRequestedIntent = RequestedIntent;
 
 export interface SendMessageOptions {
   readonly activeBookId?: string;

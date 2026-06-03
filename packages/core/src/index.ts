@@ -171,6 +171,16 @@ export {
   type InteractionRequest,
 } from "./interaction/intents.js";
 export {
+  ActionSourceSchema,
+  RequestedIntentSchema,
+  type ActionSource,
+  type RequestedIntent,
+  normalizeActionSource,
+  normalizeRequestedIntent,
+  normalizePlayMode,
+  isWriteNextInstruction,
+} from "./interaction/action-envelope.js";
+export {
   ExecutionStatusSchema,
   ExecutionStateSchema,
   InteractionEventSchema,
@@ -199,9 +209,11 @@ export {
   appendInteractionEvent,
   BookSessionSchema,
   SessionKindSchema,
+  PlayModeSchema,
   GlobalSessionSchema,
   type BookSession,
   type SessionKind,
+  type PlayMode,
   type GlobalSession,
   createBookSession,
   appendBookSessionMessage,
