@@ -3,7 +3,7 @@
   <img src="assets/inkos-text.svg" width="240" height="65" alt="InkOS">
 </p>
 
-<h1 align="center">Local AI Fiction Creation System<br><sub>本地 AI 小说与互动创作系统</sub></h1>
+<h1 align="center">Story Creation AI Agent<br><sub>面向小说写作、短篇创作、剧本开发、互动文字游戏与 IP 内容生产的创作系统</sub></h1>
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@actalk/inkos"><img src="https://img.shields.io/npm/v/@actalk/inkos.svg?color=cb3837&logo=npm" alt="npm version"></a>
