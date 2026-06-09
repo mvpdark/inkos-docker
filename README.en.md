@@ -269,9 +269,9 @@ Studio Chat is not just a Q&A box. It can create long-form books, run Short, gen
 
 Play maintains a durable interactive world state: characters, locations, items, evidence, relationships, time, current scene, HUD, and images. It is not a hard-coded RPG system. A cultivation world may use rarity and realms; a romance story may use emotional stages; a detective story may use evidence lifecycle and credibility. The rules come from the user's world contract and stay in the world state.
 
-### 33-Dimension Audit + De-AI-ification
+### 37-Dimension Audit + De-AI-ification
 
-The Continuity Auditor agent checks every draft across 33 dimensions: character memory, resource continuity, hook payoff, outline adherence, narrative pacing, emotional arcs, and more. Built-in AI-tell detection automatically catches "LLM voice" — overused words, monotonous sentence patterns, excessive summarization. The default long-form write cycle now runs at most one automatic revision pass; unresolved critical findings are kept in the result for human review or later commands.
+The Continuity Auditor agent checks every draft across 37 dimensions: character memory, resource continuity, hook payoff, outline adherence, narrative pacing, emotional arcs, and more. Built-in AI-tell detection automatically catches "LLM voice" — overused words, monotonous sentence patterns, excessive summarization. The default long-form write cycle now runs at most one automatic revision pass; unresolved critical findings are kept in the result for human review or later commands.
 
 De-AI-ification rules are baked into the Writer agent's prompts: fatigue word lists, banned patterns, style fingerprint injection — reducing AI traces at the source. `revise --mode anti-detect` runs dedicated anti-detection rewriting on existing chapters.
 
@@ -330,7 +330,7 @@ Supports any OpenAI-compatible endpoint (`--provider custom`). Stream auto-fallb
 
 ### Reliability
 
-Every chapter creates an automatic state snapshot — `inkos write rewrite` rolls back any chapter to its pre-write state. The Writer outputs a pre-write checklist (context scope, resources, pending hooks, risks) and a post-write settlement table; the Auditor cross-validates both. File locking prevents concurrent writes. Post-write validator includes cross-chapter repetition detection and 11 hard rules with auto spot-fix.
+Every chapter creates an automatic state snapshot — `inkos write rewrite` rolls back any chapter to its pre-write state. The Writer outputs a pre-write checklist (context scope, resources, pending hooks, risks) and a post-write settlement table; the Auditor cross-validates both. File locking prevents concurrent writes. Post-write validator includes cross-chapter repetition detection and a dozen hard rules with auto spot-fix.
 
 The hook system uses Zod schema validation — `lastAdvancedChapter` must be an integer, `status` can only be open/progressing/deferred/resolved. JSON deltas from the LLM are processed through `applyRuntimeStateDelta` (immutable update) and `validateRuntimeState` (structural check) before persistence. Corrupted data is rejected, not propagated.
 
@@ -342,10 +342,14 @@ Model output limits are managed by provider model cards in the provider bank. Re
 
 InkOS now has two main runtime tracks: long-form / short-form production for deliverable text, and Play for persistent interactive worlds. They share Studio Chat, model configuration, action confirmation, artifact preview, and provider handling, but their state models are different.
 
+<p align="center">
+  <img src="assets/arch-system.svg" width="900" alt="System architecture">
+</p>
+
 Long-form chapters are produced by multiple agents in sequence:
 
 <p align="center">
-  <img src="assets/screenshot-pipeline.png" width="800" alt="Pipeline diagram">
+  <img src="assets/arch-pipeline.svg" width="900" alt="Chapter pipeline">
 </p>
 
 | Agent | Responsibility |
@@ -380,7 +384,7 @@ The Settler no longer asks the model to output full markdown files. It produces 
 On Node 22+, a SQLite temporal memory database (`story/memory.db`) is automatically enabled, supporting relevance-based retrieval of historical facts, hooks, and chapter summaries — preventing context bloat from full-file injection.
 
 <p align="center">
-  <img src="assets/screenshot-state.png" width="800" alt="Truth files snapshot">
+  <img src="assets/arch-memory.svg" width="900" alt="Memory and state">
 </p>
 
 ### Control Surface and Runtime Artifacts
