@@ -12,4 +12,10 @@ describe("interactive-film-authoring tool set", () => {
   it("confirmed draft_structure = the structure tool", () => {
     expect(buildFilmAuthoringToolNames("draft_structure")).toEqual(["draft_structure"]);
   });
+  it("confirmed connect_choice = the connect tool", () => {
+    expect(buildFilmAuthoringToolNames("connect_choice")).toEqual(["connect_choice"]);
+  });
+  it("confirmed remove_node = the remove tool", () => {
+    expect(buildFilmAuthoringToolNames("remove_node")).toEqual(["remove_node"]);
+  });
 });

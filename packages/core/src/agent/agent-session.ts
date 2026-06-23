@@ -689,8 +689,11 @@ function createAgentToolsForMode(params: {
   }
 
   if (params.sessionKind === "interactive-film-authoring") {
-    const projectId = params.bookId ?? "";
-    const agentCtx = params.pipeline.createAgentContext("film-authoring", projectId || undefined);
+    const projectId = params.bookId;
+    if (!projectId) {
+      throw new Error("interactive-film-authoring session requires a non-null bookId");
+    }
+    const agentCtx = params.pipeline.createAgentContext("film-authoring", projectId);
     const llm = filmLLMDepsFromClient(agentCtx.client, agentCtx.model);
     return createFilmAuthoringTools({
       projectRoot: params.projectRoot,
