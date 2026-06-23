@@ -575,3 +575,8 @@ export {
   buildStructureDeltaFromLLMText,
 } from "./interactive-film/authoring-generate.js";
 export { summarizeStoryGraph, buildFilmAuthoringContext } from "./interactive-film/film-context.js";
+export {
+  generateNodeImage,
+  defaultNodeImageDeps,
+  type NodeImageDeps,
+} from "./interactive-film/node-image.js";

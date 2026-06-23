@@ -77,6 +77,10 @@ import {
   createRemoveNodeTool,
   filmLLMDepsFromClient,
   applyGraphDelta,
+  loadStoryGraph,
+  generateNodeImage,
+  defaultNodeImageDeps,
+  type NodeImageDeps,
   type ResolvedModel,
   type PipelineConfig,
   type PlayMode,
@@ -1805,7 +1809,7 @@ async function probeServiceCapabilities(args: {
 
 // --- Server factory ---
 
-export function createStudioServer(initialConfig: ProjectConfig, root: string) {
+export function createStudioServer(initialConfig: ProjectConfig, root: string, overrides: { readonly nodeImageGenerator?: NodeImageDeps } = {}) {
   const app = new Hono();
   const state = new StateManager(root);
   let cachedConfig = initialConfig;
@@ -4974,6 +4978,23 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
       }
       throw error;
     }
+  });
+
+  app.post("/api/v1/projects/:id/nodes/:nodeId/image", async (c) => {
+    const id = c.req.param("id");
+    const nodeId = c.req.param("nodeId");
+    if (!isSafeBookId(id)) {
+      return c.json({ error: { code: "INVALID_ID", message: `invalid project id: ${id}` } }, 400);
+    }
+    const graph = await loadStoryGraph(root, id);
+    const node = graph?.nodes.find((n) => n.id === nodeId);
+    if (!node) {
+      return c.json({ error: { code: "NODE_NOT_FOUND", message: `node ${nodeId} not found` } }, 404);
+    }
+    const deps = overrides.nodeImageGenerator ?? (await defaultNodeImageDeps(root));
+    const { assetRef, delta } = await generateNodeImage({ projectRoot: root, projectId: id, node, deps });
+    const { rev } = await applyGraphDelta({ projectRoot: root, projectId: id, delta });
+    return c.json({ assetRef, rev });
   });
 
   return app;
