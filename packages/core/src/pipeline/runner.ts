@@ -41,6 +41,7 @@ import {
 } from "../utils/outline-paths.js";
 import { loadNarrativeMemorySeed, loadSnapshotCurrentStateFacts } from "../state/runtime-state-store.js";
 import { rewriteStructuredStateFromMarkdown } from "../state/state-bootstrap.js";
+import { readFileSync } from "node:fs";
 import { readFile, readdir, writeFile, mkdir, rename, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import {
@@ -263,6 +264,7 @@ export interface PipelineConfig {
   readonly radarSources?: ReadonlyArray<RadarSource>;
   readonly externalContext?: string;
   readonly modelOverrides?: Record<string, string | AgentLLMOverride>;
+  readonly serviceApiKeys?: Record<string, string>;
   readonly inputGovernanceMode?: InputGovernanceMode;
   readonly logger?: Logger;
   readonly onStreamProgress?: OnStreamProgress;
@@ -379,10 +381,26 @@ export class PipelineRunner {
   private readonly config: PipelineConfig;
   private readonly agentClients = new Map<string, LLMClient>();
   private memoryIndexFallbackWarned = false;
+  private readonly serviceApiKeys: Record<string, string>;
 
   constructor(config: PipelineConfig) {
     this.config = config;
     this.state = new StateManager(config.projectRoot);
+    this.serviceApiKeys = config.serviceApiKeys ?? PipelineRunner.loadServiceApiKeys(config.projectRoot);
+  }
+
+  private static loadServiceApiKeys(projectRoot: string): Record<string, string> {
+    try {
+      const raw = readFileSync(join(projectRoot, ".inkos", "secrets.json"), "utf-8");
+      const parsed = JSON.parse(raw) as { services?: Record<string, { apiKey?: string }> };
+      const result: Record<string, string> = {};
+      for (const [svc, entry] of Object.entries(parsed.services ?? {})) {
+        if (entry?.apiKey) result[svc] = entry.apiKey;
+      }
+      return result;
+    } catch {
+      return {};
+    }
   }
 
   private localize(language: LengthLanguage, messages: { zh: string; en: string }): string {
@@ -568,34 +586,53 @@ export class PipelineRunner {
     if (typeof override === "string") {
       return { model: override, client: this.config.client };
     }
-    // Full override — needs its own client if baseUrl differs
-    if (!override.baseUrl) {
+    const base = this.config.defaultLLMConfig;
+    const overrideService = override.service;
+    const explicitBaseUrl = override.baseUrl ?? "";
+
+    // If no explicit baseUrl and no different service, reuse default client
+    if (!explicitBaseUrl && (!overrideService || overrideService === base?.service)) {
       return { model: override.model, client: this.config.client };
     }
-    const base = this.config.defaultLLMConfig;
+
+    // Determine the service for the new client
+    const serviceForClient = overrideService ?? base?.service ?? "custom";
+
+    // Resolve API key: apiKeyEnv > service secret > base apiKey
+    let apiKey = "";
+    if (override.apiKeyEnv) {
+      apiKey = process.env[override.apiKeyEnv] ?? "";
+    }
+    if (!apiKey && overrideService) {
+      apiKey = this.serviceApiKeys[overrideService] ?? "";
+    }
+    if (!apiKey) {
+      apiKey = base?.apiKey ?? "";
+    }
+
     const provider = override.provider ?? base?.provider ?? "custom";
     const apiKeySource = override.apiKeyEnv
       ? `env:${override.apiKeyEnv}`
-      : `base:${base?.apiKey ?? ""}`;
+      : overrideService
+        ? `svc:${overrideService}`
+        : `base:${base?.apiKey ?? ""}`;
     const stream = override.stream ?? base?.stream ?? true;
     const apiFormat = base?.apiFormat ?? "chat";
     const cacheKey = [
       provider,
-      override.baseUrl,
+      serviceForClient,
+      explicitBaseUrl,
       apiKeySource,
       `stream:${stream}`,
       `format:${apiFormat}`,
     ].join("|");
     let client = this.agentClients.get(cacheKey);
     if (!client) {
-      const apiKey = override.apiKeyEnv
-        ? process.env[override.apiKeyEnv] ?? ""
-        : base?.apiKey ?? "";
       client = createLLMClient({
         provider,
-        service: base?.service ?? "custom",
+        service: serviceForClient,
         configSource: base?.configSource ?? "env",
-        baseUrl: override.baseUrl,
+        baseUrl: explicitBaseUrl,
         apiKey,
         model: override.model,
         temperature: base?.temperature ?? 0.7,
