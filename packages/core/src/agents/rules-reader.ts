@@ -2,7 +2,7 @@ import { readFile, readdir } from "node:fs/promises";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseGenreProfile, type ParsedGenreProfile } from "../models/genre-profile.js";
-import { parseBookRules, type ParsedBookRules } from "../models/book-rules.js";
+import { parseBookRules, tryParseBookRulesFrontmatter, type ParsedBookRules } from "../models/book-rules.js";
 import { BookConfigSchema } from "../models/book.js";
 
 const BUILTIN_GENRES_DIR = join(dirname(fileURLToPath(import.meta.url)), "../../genres");
@@ -86,13 +86,48 @@ export function getBuiltinGenresDir(): string {
 }
 
 /**
- * Load book_rules.md from the book's story directory.
- * Returns null if the file doesn't exist.
+ * Load structured book rules.
+ *
+ * New books keep the authoritative rules in story/book_rules.md as ordinary
+ * Markdown; parseBookRules() extracts the small structured surface the runtime
+ * needs and preserves the Markdown as body. Older Phase 5 books may still have
+ * YAML frontmatter on outline/story_frame.md with book_rules.md as a shim; that
+ * path is legacy fallback only.
  */
 export async function readBookRules(bookDir: string): Promise<ParsedBookRules | null> {
-  const raw = await tryReadFile(join(bookDir, "story/book_rules.md"));
-  if (!raw) return null;
-  return parseBookRules(raw);
+  const rulesRaw = await tryReadFile(join(bookDir, "story/book_rules.md"));
+  if (rulesRaw) {
+    const parsed = parseBookRules(rulesRaw);
+    if (parsed) return parsed;
+  }
+
+  const storyFrameRaw = await tryReadFile(join(bookDir, "story/outline/story_frame.md"));
+  if (storyFrameRaw) {
+    // Extract just the leading `---\n...\n---` block. Anything after it is
+    // outline prose and must NOT leak into ParsedBookRules.body.
+    const frontmatterMatch = storyFrameRaw.match(/^\s*(---\s*\n[\s\S]*?\n---\s*)(?:\n|$)/);
+    if (frontmatterMatch) {
+      // Phase 5 hotfix 3: use the strict parser so a broken YAML block does
+      // NOT silently zero out protagonist / prohibitions / genreLock. If the
+      // frontmatter is malformed we log and fall through to legacy.
+      const parsed = tryParseBookRulesFrontmatter(frontmatterMatch[1], (err) => {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[rules-reader] story_frame.md frontmatter is malformed at ${bookDir}/story/outline/story_frame.md — falling back to legacy book_rules.md. Error: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+      if (parsed) return parsed;
+      // fall through to legacy fallback below
+    }
+  }
+
+  if (rulesRaw) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[rules-reader] book_rules.md at ${bookDir}/story/book_rules.md is a compat shim and no legacy story_frame frontmatter was parseable — returning null instead of silently zeroing out rules.`,
+    );
+  }
+  return null;
 }
 
 export async function readBookLanguage(bookDir: string): Promise<"zh" | "en" | undefined> {

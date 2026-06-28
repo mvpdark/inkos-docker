@@ -10,6 +10,12 @@ export interface ValidationResult {
   readonly passed: boolean;
 }
 
+export interface StateValidationAuthorityContext {
+  readonly storyFrame?: string;
+  readonly bookRules?: string;
+  readonly chapterSummaries?: string;
+}
+
 /**
  * Validates Settler output by comparing old and new truth files via LLM.
  * Catches contradictions, missing state changes, and temporal inconsistencies.
@@ -31,6 +37,7 @@ export class StateValidatorAgent extends BaseAgent {
     oldHooks: string,
     newHooks: string,
     language: "zh" | "en" = "zh",
+    authorityContext?: StateValidationAuthorityContext,
   ): Promise<ValidationResult> {
     const stateDiff = this.computeDiff(oldState, newState, "State Card");
     const hooksDiff = this.computeDiff(oldHooks, newHooks, "Hooks Pool");
@@ -53,6 +60,7 @@ Given the chapter text and the CHANGES made to truth files (state card + hooks p
 3. Temporal impossibility — character moves locations without transition, injury heals without time passing
 4. Hook anomaly — a hook disappeared without being marked resolved, or a new hook has no basis in the chapter
 5. Retroactive edit — truth file change implies something happened in a PREVIOUS chapter, not the current one
+6. Cross-truth key-setting conflict — numbered rules, named laws, ranks, identities, locations, or relationship labels in the new truth files contradict the chapter text or the authority context
 
 Output format (simple, NOT JSON):
 - First line: exactly PASS or FAIL (nothing else on this line)
@@ -76,7 +84,11 @@ IMPORTANT: Output FAIL ONLY for hard contradictions — facts that directly conf
 - Hook management differences that don't contradict text
 These should be warnings with PASS, not FAIL.`;
 
+    const authorityBlock = this.buildAuthorityContextBlock(authorityContext);
+
     const userPrompt = `Chapter ${chapterNumber} validation:
+
+${authorityBlock}
 
 ## State Card Changes
 ${stateDiff || "(no changes)"}
@@ -85,7 +97,7 @@ ${stateDiff || "(no changes)"}
 ${hooksDiff || "(no changes)"}
 
 ## Chapter Text (for reference)
-${chapterContent.slice(0, 6000)}`;
+${chapterContent}`;
 
     try {
       const response = await this.chat(
@@ -93,7 +105,7 @@ ${chapterContent.slice(0, 6000)}`;
           { role: "system", content: systemPrompt },
           { role: "user", content: userPrompt },
         ],
-        { temperature: 0.1, maxTokens: 2048 },
+        { temperature: 0.1 },
       );
 
       return this.parseResult(response.content);
@@ -118,6 +130,28 @@ ${chapterContent.slice(0, 6000)}`;
     if (removed.length > 0) parts.push("Removed:\n" + removed.map((l) => `- ${l}`).join("\n"));
     if (added.length > 0) parts.push("Added:\n" + added.map((l) => `+ ${l}`).join("\n"));
     return parts.join("\n");
+  }
+
+  private buildAuthorityContextBlock(authorityContext?: StateValidationAuthorityContext): string {
+    if (!authorityContext) return "## Authority / Cross-Truth Context\n(no authority context provided)";
+
+    const storyFrame = (authorityContext.storyFrame ?? "").trim();
+    const bookRules = (authorityContext.bookRules ?? "").trim();
+    const chapterSummaries = (authorityContext.chapterSummaries ?? "").trim();
+
+    return [
+      "## Authority / Cross-Truth Context",
+      "Authority priority: current chapter text > runtime truth files/current summaries > story_frame/book_rules > legacy story_bible intro or marketing-style prose. If the current chapter establishes a numbered/name mapping, new truth files must follow that mapping instead of preserving an older intro-only version.",
+      "",
+      "### story_frame / legacy story_bible excerpt",
+      storyFrame || "(empty)",
+      "",
+      "### book_rules excerpt",
+      bookRules || "(empty)",
+      "",
+      "### recent chapter_summaries excerpt",
+      chapterSummaries || "(empty)",
+    ].join("\n");
   }
 
   private parseResult(content: string): ValidationResult {

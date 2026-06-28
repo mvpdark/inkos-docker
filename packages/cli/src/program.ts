@@ -24,7 +24,8 @@ import { analyticsCommand } from "./commands/analytics.js";
 import { evalCommand } from "./commands/eval.js";
 import { importCommand } from "./commands/import.js";
 import { fanficCommand } from "./commands/fanfic.js";
-import { studioCommand } from "./commands/studio.js";
+import { shortCommand } from "./commands/short-fiction.js";
+import { createStudioCommand, launchStudioEntry } from "./commands/studio.js";
 import { consolidateCommand } from "./commands/consolidate.js";
 import { createInteractCommand, type InteractCommandHooks } from "./commands/interact.js";
 import { createTuiCommand } from "./commands/tui.js";
@@ -35,7 +36,7 @@ const { version } = require("../package.json") as { version: string };
 
 export interface ProgramHooks {
   readonly launchTui?: (projectRoot: string) => Promise<void> | void;
-  readonly runInteraction?: InteractCommandHooks["runInteraction"];
+  readonly launchStudio?: (projectRoot: string, port: string) => Promise<void> | void;
   readonly readInteractionInput?: InteractCommandHooks["readInput"];
 }
 
@@ -46,12 +47,16 @@ export function createProgram(hooks: ProgramHooks = {}): Command {
     .name("inkos")
     .description("InkOS — Multi-agent novel production system")
     .version(version)
+    .enablePositionalOptions()
+    .option("--service <service>", "Override LLM service for this CLI run")
+    .option("--model <model>", "Override LLM model for this CLI run")
+    .option("--api-key-env <envVar>", "Read LLM API key from this environment variable for this CLI run")
+    .option("--base-url <url>", "Override LLM base URL for this CLI run")
+    .option("--api-format <chat|responses>", "Override LLM API format for this CLI run")
+    .option("--stream", "Force streaming LLM responses for this CLI run")
+    .option("--no-stream", "Force non-streaming LLM responses for this CLI run")
     .action(async () => {
-      if (hooks.launchTui) {
-        await hooks.launchTui(process.cwd());
-        return;
-      }
-      await launchTui(process.cwd());
+      await launchStudioEntry(process.cwd(), "4567", { launchStudio: hooks.launchStudio });
     });
 
   program.addCommand(initCommand);
@@ -79,10 +84,10 @@ export function createProgram(hooks: ProgramHooks = {}): Command {
   program.addCommand(evalCommand);
   program.addCommand(importCommand);
   program.addCommand(fanficCommand);
-  program.addCommand(studioCommand);
+  program.addCommand(shortCommand);
+  program.addCommand(createStudioCommand({ launchStudio: hooks.launchStudio }));
   program.addCommand(consolidateCommand);
   program.addCommand(createInteractCommand({
-    runInteraction: hooks.runInteraction,
     readInput: hooks.readInteractionInput,
   }));
   program.addCommand(createTuiCommand({ launchTui: hooks.launchTui }));

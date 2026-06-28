@@ -1,12 +1,15 @@
 {
   "name": "@actalk/inkos-core",
-  "version": "1.2.0",
-  "description": "InkOS core engine — multi-agent novel writing pipeline with 33-dimension continuity audit, style cloning, and de-AI-ification",
+  "version": "1.5.0",
+  "description": "InkOS core engine for story creation agents: governed context, writing, audit, revision, covers, and interactive worlds",
   "keywords": [
+    "story-creation-ai-agent",
+    "story-agent",
     "ai-novel-writing",
     "ai-writing-agent",
     "novel-generator",
-    "multi-agent-pipeline",
+    "interactive-fiction",
+    "ip-content",
     "continuity-audit",
     "style-cloning",
     "ai-fiction",
@@ -21,6 +24,14 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./interactive-film/evaluator": {
+      "types": "./dist/interactive-film/evaluator.d.ts",
+      "import": "./dist/interactive-film/evaluator.js"
+    },
+    "./interactive-film/graph-schema": {
+      "types": "./dist/interactive-film/graph-schema.d.ts",
+      "import": "./dist/interactive-film/graph-schema.js"
     }
   },
   "files": [
@@ -44,11 +55,14 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.78.0",
+    "@mariozechner/pi-agent-core": "^0.67.1",
+    "@mariozechner/pi-ai": "^0.67.1",
+    "@sinclair/typebox": "^0.34.49",
     "dotenv": "^16.4.0",
+    "epub-gen-memory": "^1.0.10",
     "js-yaml": "^4.1.1",
-    "openai": "^4.80.0",
-    "zod": "^3.24.0"
+    "undici": "6.21.3",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/js-yaml": "^4.0.9",

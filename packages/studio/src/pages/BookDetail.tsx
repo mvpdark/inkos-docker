@@ -24,7 +24,9 @@ import {
   RefreshCw,
   Sparkles,
   Trash2,
-  Save
+  Save,
+  Hand,
+  Settings2
 } from "lucide-react";
 
 interface ChapterMeta {
@@ -108,6 +110,16 @@ export function BookDetail({
   const [settingsStatus, setSettingsStatus] = useState<BookStatus | null>(null);
   const [exportFormat, setExportFormat] = useState<ExportFormat>("txt");
   const [exportApprovedOnly, setExportApprovedOnly] = useState(false);
+  const [bookActionPending, setBookActionPending] = useState<string | null>(null);
+  // Auto (pipeline self-reviews) vs manual (write the draft and stop; you
+  // run audit / revise / approve as checkpoint actions). This is scoped to
+  // the current book, with project-level mode as the inherited default.
+  const [reviewMode, setReviewMode] = useState<"auto" | "manual">("auto");
+  useEffect(() => {
+    void fetchJson<{ mode?: string }>(`/books/${encodeURIComponent(bookId)}/chapter-review-mode`)
+      .then((r) => setReviewMode(r.mode === "manual" ? "manual" : "auto"))
+      .catch(() => undefined);
+  }, [bookId]);
   const activity = useMemo(() => deriveBookActivity(sse.messages, bookId), [bookId, sse.messages]);
   const writing = writeRequestPending || activity.writing;
   const drafting = draftRequestPending || activity.drafting;
@@ -157,11 +169,25 @@ export function BookDetail({
     }
   };
 
+  const handleToggleReviewMode = async () => {
+    const next = reviewMode === "manual" ? "auto" : "manual";
+    setReviewMode(next);
+    try {
+      await fetchJson(`/books/${encodeURIComponent(bookId)}/chapter-review-mode`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode: next }),
+      });
+    } catch {
+      setReviewMode(reviewMode); // revert on failure
+    }
+  };
+
   const handleDeleteBook = async () => {
     setConfirmDeleteOpen(false);
     setDeleting(true);
     try {
-      const res = await fetch(`/api/books/${bookId}`, { method: "DELETE" });
+      const res = await fetch(`/api/v1/books/${bookId}`, { method: "DELETE" });
       if (!res.ok) {
         const json = await res.json().catch(() => ({}));
         throw new Error((json as { error?: string }).error ?? `${res.status}`);
@@ -281,6 +307,115 @@ export function BookDetail({
     refetch();
   };
 
+  const runBookAction = async (key: string, action: () => Promise<string>) => {
+    setBookActionPending(key);
+    try {
+      alert(await action());
+      refetch();
+    } catch (e) {
+      alert(e instanceof Error ? e.message : "Action failed");
+    } finally {
+      setBookActionPending(null);
+    }
+  };
+
+  const handleEvaluate = async () => {
+    await runBookAction("eval", async () => {
+      const result = await fetchJson<{
+        qualityScore: number;
+        totalChapters: number;
+        totalWords: number;
+        auditPassRate: number;
+        avgAiTellDensity: number;
+        hookResolveRate: number;
+      }>(`/books/${bookId}/eval`);
+      return [
+        `${t("book.evaluate")}: ${result.qualityScore}/100`,
+        `${t("dash.chapters")}: ${result.totalChapters}`,
+        `${t("book.words")}: ${result.totalWords.toLocaleString()}`,
+        `Audit: ${result.auditPassRate}%`,
+        `AI tells: ${result.avgAiTellDensity}/1k`,
+        `Hooks: ${result.hookResolveRate}%`,
+      ].join("\n");
+    });
+  };
+
+  const handleConsolidate = async () => {
+    await runBookAction("consolidate", async () => {
+      const result = await fetchJson<{ archivedVolumes?: number; retainedChapters?: number }>(`/books/${bookId}/consolidate`, {
+        method: "POST",
+      });
+      return data?.book.language === "en"
+        ? `Consolidated ${result.archivedVolumes ?? 0} volume(s). Retained ${result.retainedChapters ?? 0} recent chapter summaries.`
+        : `已归并 ${result.archivedVolumes ?? 0} 个卷摘要，保留最近 ${result.retainedChapters ?? 0} 条章节摘要。`;
+    });
+  };
+
+  const handleReviseFoundation = async () => {
+    const feedback = window.prompt(
+      data?.book.language === "en"
+        ? "Foundation revision feedback. This rewrites the book foundation, not chapter body."
+        : "输入重修基础设定的反馈。此操作会重写基础设定，不直接改正文。",
+      "",
+    );
+    if (!feedback?.trim()) return;
+    await runBookAction("revise-foundation", async () => {
+      await fetchJson(`/books/${bookId}/foundation/revise`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ feedback }),
+      });
+      return data?.book.language === "en" ? "Foundation revised." : "基础设定已重修。";
+    });
+  };
+
+  const handlePlan = async () => {
+    const context = window.prompt(
+      data?.book.language === "en"
+        ? "Optional planning context for the next chapter."
+        : "可选：下一章规划补充说明。",
+      "",
+    );
+    if (context === null) return;
+    await runBookAction("plan", async () => {
+      const result = await fetchJson<{ chapterNumber?: number; title?: string }>(`/books/${bookId}/plan`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ context: context.trim() || undefined }),
+      });
+      return data?.book.language === "en"
+        ? `Planned chapter ${result.chapterNumber ?? "?"}: ${result.title ?? ""}`
+        : `已计划第 ${result.chapterNumber ?? "?"} 章：${result.title ?? ""}`;
+    });
+  };
+
+  const handleCompose = async () => {
+    const context = window.prompt(
+      data?.book.language === "en"
+        ? "Optional compose context for the next chapter."
+        : "可选：下一章组装补充说明。",
+      "",
+    );
+    if (context === null) return;
+    await runBookAction("compose", async () => {
+      const result = await fetchJson<{ chapterNumber?: number; title?: string }>(`/books/${bookId}/compose`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ context: context.trim() || undefined }),
+      });
+      return data?.book.language === "en"
+        ? `Composed chapter ${result.chapterNumber ?? "?"}: ${result.title ?? ""}`
+        : `已组装第 ${result.chapterNumber ?? "?"} 章：${result.title ?? ""}`;
+    });
+  };
+
+  const handleRepairState = async (chapterNum: number) => {
+    await runBookAction(`repair-state-${chapterNum}`, async () => {
+      await fetchJson(`/books/${bookId}/repair-state/${chapterNum}`, { method: "POST" });
+      return data?.book.language === "en" ? `Chapter ${chapterNum} state repaired.` : `第 ${chapterNum} 章状态已修复。`;
+    });
+  };
+
   if (loading) return (
     <div className="flex flex-col items-center justify-center py-32 space-y-4">
       <div className="w-8 h-8 border-2 border-primary/20 border-t-primary rounded-full animate-spin" />
@@ -299,7 +434,7 @@ export function BookDetail({
   const currentTargetChapters = settingsTargetChapters ?? book.targetChapters ?? 0;
   const currentStatus = settingsStatus ?? (book.status as BookStatus);
 
-  const exportHref = `/api/books/${bookId}/export?format=${exportFormat}${exportApprovedOnly ? "&approvedOnly=true" : ""}`;
+  const exportHref = `/api/v1/books/${bookId}/export?format=${exportFormat}${exportApprovedOnly ? "&approvedOnly=true" : ""}`;
 
   return (
     <div className="space-y-8 fade-in">
@@ -362,6 +497,16 @@ export function BookDetail({
             {drafting ? t("book.drafting") : t("book.draftOnly")}
           </button>
           <button
+            onClick={handleToggleReviewMode}
+            title={reviewMode === "manual"
+              ? "手动审查：写完即停，由你点 审稿/修订/通过（更快、更可控）。点此切回自动。"
+              : "自动审查：写完自动审校并按需重写（更省心，但更慢）。点此切到手动·写完即停。"}
+            className="flex items-center gap-2 px-4 py-2.5 text-sm font-medium bg-secondary/60 text-foreground rounded-xl border border-border/50 hover:bg-secondary transition-all"
+          >
+            {reviewMode === "manual" ? <Hand size={16} /> : <Settings2 size={16} />}
+            {reviewMode === "manual" ? "审查：手动·写完即停" : "审查：自动"}
+          </button>
+          <button
             onClick={() => setConfirmDeleteOpen(true)}
             disabled={deleting}
             className="flex items-center gap-2 px-5 py-2.5 text-sm font-bold bg-destructive/10 text-destructive rounded-xl hover:bg-destructive hover:text-white transition-all border border-destructive/20 disabled:opacity-50"
@@ -416,6 +561,46 @@ export function BookDetail({
           >
             <BarChart2 size={14} />
             {t("book.analytics")}
+          </button>
+          <button
+            onClick={handleEvaluate}
+            disabled={bookActionPending === "eval"}
+            className="flex items-center gap-2 px-4 py-2 text-xs font-bold bg-secondary/50 text-muted-foreground rounded-lg hover:text-foreground hover:bg-secondary transition-all border border-border/50 disabled:opacity-50"
+          >
+            <Search size={14} />
+            {bookActionPending === "eval" ? t("common.loading") : t("book.evaluate")}
+          </button>
+          <button
+            onClick={handleConsolidate}
+            disabled={bookActionPending === "consolidate"}
+            className="flex items-center gap-2 px-4 py-2 text-xs font-bold bg-secondary/50 text-muted-foreground rounded-lg hover:text-foreground hover:bg-secondary transition-all border border-border/50 disabled:opacity-50"
+          >
+            <Database size={14} />
+            {bookActionPending === "consolidate" ? t("common.loading") : t("book.consolidate")}
+          </button>
+          <button
+            onClick={handleReviseFoundation}
+            disabled={bookActionPending === "revise-foundation"}
+            className="flex items-center gap-2 px-4 py-2 text-xs font-bold bg-secondary/50 text-muted-foreground rounded-lg hover:text-foreground hover:bg-secondary transition-all border border-border/50 disabled:opacity-50"
+          >
+            <Sparkles size={14} />
+            {bookActionPending === "revise-foundation" ? t("common.loading") : t("book.reviseFoundation")}
+          </button>
+          <button
+            onClick={handlePlan}
+            disabled={bookActionPending === "plan"}
+            className="flex items-center gap-2 px-4 py-2 text-xs font-bold bg-secondary/50 text-muted-foreground rounded-lg hover:text-foreground hover:bg-secondary transition-all border border-border/50 disabled:opacity-50"
+          >
+            <FileText size={14} />
+            {bookActionPending === "plan" ? t("common.loading") : t("book.planNext")}
+          </button>
+          <button
+            onClick={handleCompose}
+            disabled={bookActionPending === "compose"}
+            className="flex items-center gap-2 px-4 py-2 text-xs font-bold bg-secondary/50 text-muted-foreground rounded-lg hover:text-foreground hover:bg-secondary transition-all border border-border/50 disabled:opacity-50"
+          >
+            <Wand2 size={14} />
+            {bookActionPending === "compose" ? t("common.loading") : t("book.composeNext")}
           </button>
           <div className="flex items-center gap-2">
             <select
@@ -599,6 +784,18 @@ export function BookDetail({
                           ? <div className="w-3.5 h-3.5 border-2 border-muted-foreground/20 border-t-muted-foreground rounded-full animate-spin" />
                           : <RefreshCw size={14} />}
                       </button>
+                      {ch.status === "state-degraded" && (
+                        <button
+                          onClick={() => handleRepairState(ch.number)}
+                          disabled={bookActionPending === `repair-state-${ch.number}`}
+                          className="p-2 rounded-lg bg-amber-500/10 text-amber-600 hover:bg-amber-500 hover:text-white transition-all shadow-sm disabled:opacity-50"
+                          title={t("book.repairState")}
+                        >
+                          {bookActionPending === `repair-state-${ch.number}`
+                            ? <div className="w-3.5 h-3.5 border-2 border-amber-600/20 border-t-amber-600 rounded-full animate-spin" />
+                            : <Settings2 size={14} />}
+                        </button>
+                      )}
                       <select
                         disabled={revisingChapters.includes(ch.number)}
                         value=""

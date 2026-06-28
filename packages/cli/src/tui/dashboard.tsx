@@ -1,20 +1,16 @@
 import React, { useEffect, useRef, useState } from "react";
 import {
   appendInteractionMessage,
-  processProjectInteractionInput,
-  routeNaturalLanguageIntent,
-  type InteractionIntentType,
-  type InteractionRuntimeTools,
   type InteractionSession,
 } from "@actalk/inkos-core";
 import { Box, Text, useApp, useInput } from "ink";
+import { processTuiAgentInput } from "./agent-input.js";
 import { describeActivityState } from "./activity-state.js";
 import { resolveComposerCaretState } from "./composer-caret.js";
 import { resolveChatDepthProfile, type ChatDepth } from "./chat-depth.js";
 import { appendStreamingAssistantChunk, createOptimisticUserMessageSession } from "./chat-draft.js";
 import { renderComposerDisplay } from "./composer-display.js";
 import { renderMarkdown } from "./markdown.js";
-import { formatTuiResult } from "./output.js";
 import { buildDashboardViewModel, type DashboardMessageRow } from "./dashboard-model.js";
 import { buildInputHistory, moveHistoryCursor } from "./input-history.js";
 import { formatModeLabel, getTuiCopy, normalizeStageLabel, type TuiLocale } from "./i18n.js";
@@ -58,7 +54,6 @@ export interface InkTuiAppProps {
   readonly projectName: string;
   readonly modelLabel: string;
   readonly initialSession: InteractionSession;
-  readonly tools: InteractionRuntimeTools;
   readonly chatStreamBridge?: {
     onTextDelta?: (text: string) => void;
     getChatRequestOptions?: () => {
@@ -105,13 +100,9 @@ export function InkTuiDashboard(props: InkTuiDashboardProps): React.JSX.Element 
         )}
       </Box>
 
-      {/* Status strip */}
+      {/* Composer area */}
       <Box flexDirection="column" marginTop={1}>
         <Text color={WARM_BORDER}>{thinRule}</Text>
-        <Box marginTop={1}>
-          <ExecutionBadge status={model.executionStatus} color={activeAccent} />
-          <Text color={activeAccent}> {model.statusPrimaryLine}</Text>
-        </Box>
 
         {/* Composer input */}
         <Box
@@ -159,6 +150,10 @@ export function InkTuiDashboard(props: InkTuiDashboardProps): React.JSX.Element 
             </Box>
           ) : null}
         </Box>
+        <Box marginTop={1}>
+          <ExecutionBadge status={model.executionStatus} color={activeAccent} />
+          <Text color={activeAccent}> {model.statusPrimaryLine}</Text>
+        </Box>
       </Box>
     </Box>
   );
@@ -178,14 +173,13 @@ export function InkTuiApp(props: InkTuiAppProps): React.JSX.Element {
     cursor: null,
     draft: "",
   });
-  const [activityIntent, setActivityIntent] = useState<InteractionIntentType | "unknown">("unknown");
   const [activityFrameIndex, setActivityFrameIndex] = useState(0);
   const [chatDepth, setChatDepth] = useState<ChatDepth>("normal");
   const assistantDraftTimestampRef = useRef<number | null>(null);
   const submitLockRef = useRef(false);
   const slashSuggestions = getSlashSuggestions(inputValue, SLASH_COMMANDS);
   const inputHistory = buildInputHistory(session.messages);
-  const activity = describeActivityState(activityIntent, copy);
+  const activity = describeActivityState(copy);
   const chatDepthProfile = resolveChatDepthProfile(chatDepth);
   const composerCaret = resolveComposerCaretState({
     inputValue,
@@ -352,15 +346,9 @@ export function InkTuiApp(props: InkTuiAppProps): React.JSX.Element {
       }
 
       const activeBookId = await resolveSessionActiveBook(props.projectRoot, session);
-      const routed = routeNaturalLanguageIntent(input, {
-        activeBookId,
-        hasCreationDraft: Boolean(session.creationDraft),
-        hasFailed: session.currentExecution?.status === "failed",
-      });
       const userTimestamp = Date.now();
-      const assistantDraftTimestamp = routed.intent === "chat" ? userTimestamp + 1 : null;
+      const assistantDraftTimestamp = userTimestamp + 1;
       assistantDraftTimestampRef.current = assistantDraftTimestamp;
-      setActivityIntent(routed.intent);
       setIsSubmitting(true);
       setLastError(undefined);
       setInputValue("");
@@ -368,27 +356,16 @@ export function InkTuiApp(props: InkTuiAppProps): React.JSX.Element {
       setHistoryState({ cursor: null, draft: "" });
       setSession((current) => createOptimisticUserMessageSession(current, input, userTimestamp));
 
-      const result = await processProjectInteractionInput({
+      const result = await processTuiAgentInput({
         projectRoot: props.projectRoot,
         input,
-        tools: props.tools,
+        session,
         activeBookId,
+        onTextDelta: (text) => {
+          props.chatStreamBridge?.onTextDelta?.(text);
+        },
       });
-      const summary = formatTuiResult({
-        intent: result.request.intent,
-        status: result.session.currentExecution?.status ?? "completed",
-        bookId: result.session.activeBookId,
-        mode: result.request.mode,
-        responseText: result.responseText,
-        locale: props.locale,
-      });
-      const nextSession = appendInteractionMessage(result.session, {
-        role: "assistant",
-        content: summary,
-        timestamp: Date.now(),
-      });
-      await persistProjectSession(props.projectRoot, nextSession);
-      setSession(nextSession);
+      setSession(result.session);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const failedSession = await loadProjectSession(props.projectRoot);
@@ -397,7 +374,6 @@ export function InkTuiApp(props: InkTuiAppProps): React.JSX.Element {
     } finally {
       assistantDraftTimestampRef.current = null;
       setIsSubmitting(false);
-      setActivityIntent("unknown");
       submitLockRef.current = false;
     }
   };

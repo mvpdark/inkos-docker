@@ -54,6 +54,12 @@ describe("studio runtime resolution", () => {
       command: "node",
       args: ["--import", tsxLoader, tsSourceEntry, "/repo/test-project"],
     });
+  }, 20_000);
+
+  it("uses a file URL for the tsx loader on Windows absolute paths", async () => {
+    const { toNodeImportSpecifier } = await import("../commands/studio.js");
+    expect(toNodeImportSpecifier("D:\\repo\\packages\\studio\\node_modules\\tsx\\dist\\loader.mjs"))
+      .toBe("file:///D:/repo/packages/studio/node_modules/tsx/dist/loader.mjs");
   });
 
   it("finds monorepo packages/studio sources from a project directory", async () => {

@@ -95,6 +95,22 @@ describe("StateManager", () => {
       expect(loaded).toEqual([]);
     });
 
+    it("rebuilds the chapter index from chapter files when index.json is empty", async () => {
+      const bookDir = manager.bookDir("rebuild-book");
+      await mkdir(join(bookDir, "chapters"), { recursive: true });
+      await writeFile(join(bookDir, "chapters", "index.json"), "[]", "utf-8");
+      await writeFile(join(bookDir, "chapters", "0001_雨棚.md"), "# 第1章 雨棚\n\n正文。", "utf-8");
+      await writeFile(join(bookDir, "chapters", "0002_账页.md"), "# 第2章 账页\n\n正文。", "utf-8");
+
+      const loaded = await manager.loadChapterIndex("rebuild-book");
+
+      expect(loaded.map((chapter) => chapter.number)).toEqual([1, 2]);
+      expect(loaded[0]).toMatchObject({
+        title: "雨棚",
+        status: "ready-for-review",
+      });
+    });
+
     it("creates the chapters directory on save", async () => {
       await manager.saveChapterIndex("book-b", []);
       const dirStat = await stat(
@@ -678,6 +694,22 @@ describe("StateManager", () => {
       expect(String(rejected[0]?.reason)).toMatch(/is locked/);
     });
 
+    it("reclaims same-process stale lock when no active write is in progress", async () => {
+      await mkdir(manager.bookDir("lock-book-self"), { recursive: true });
+      const lockPath = join(manager.bookDir("lock-book-self"), ".write.lock");
+      // Simulate a stale lock left by our own process (e.g. after a failed pipeline)
+      await writeFile(lockPath, `pid:${process.pid} ts:${Date.now() - 60000}`, "utf-8");
+
+      // Should auto-reclaim since our process knows it's not actively writing this book
+      const release = await manager.acquireBookLock("lock-book-self");
+      expect(typeof release).toBe("function");
+
+      const lockData = await readFile(lockPath, "utf-8");
+      expect(lockData).toContain(`pid:${process.pid}`);
+
+      await release();
+    });
+
     it("reclaims a stale lock when the recorded pid is no longer alive", async () => {
       await mkdir(manager.bookDir("lock-book-5"), { recursive: true });
       const lockPath = join(manager.bookDir("lock-book-5"), ".write.lock");
@@ -753,6 +785,19 @@ describe("StateManager", () => {
       expect(authorIntent).toContain("mentor conflict");
       expect(currentFocus).toContain("Current Focus");
       expect(runtimeStat.isDirectory()).toBe(true);
+    });
+
+    it("creates Phase 5 outline/ and roles/ directories", async () => {
+      await manager.ensureControlDocuments("phase5-book");
+
+      const storyDir = join(manager.bookDir("phase5-book"), "story");
+      const outlineStat = await stat(join(storyDir, "outline"));
+      const rolesMajorStat = await stat(join(storyDir, "roles", "主要角色"));
+      const rolesMinorStat = await stat(join(storyDir, "roles", "次要角色"));
+
+      expect(outlineStat.isDirectory()).toBe(true);
+      expect(rolesMajorStat.isDirectory()).toBe(true);
+      expect(rolesMinorStat.isDirectory()).toBe(true);
     });
 
     it("bootstraps and returns safe defaults for legacy books", async () => {

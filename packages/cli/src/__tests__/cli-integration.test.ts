@@ -9,20 +9,35 @@ import { StateManager } from "@actalk/inkos-core";
 const testDir = dirname(fileURLToPath(import.meta.url));
 const cliDir = resolve(testDir, "..", "..");
 const cliEntry = resolve(cliDir, "dist", "index.js");
+const CLI_PROCESS_TIMEOUT_MS = 10_000;
+const DOUBLE_CLI_INVOCATION_TEST_TIMEOUT_MS = CLI_PROCESS_TIMEOUT_MS * 2;
 
 let projectDir: string;
+
+function buildTestEnv(overrides?: Record<string, string>) {
+  const baseEnv = Object.fromEntries(
+    Object.entries(process.env).filter(([key]) =>
+      !key.startsWith("INKOS_")
+      && !key.startsWith("OPENAI_")
+      && !key.startsWith("ANTHROPIC_")
+      && key !== "TAVILY_API_KEY",
+    ),
+  );
+
+  return {
+    ...baseEnv,
+    // Prevent global config from leaking into tests
+    HOME: projectDir,
+    ...overrides,
+  };
+}
 
 function run(args: string[], options?: { env?: Record<string, string> }): string {
   return execFileSync("node", [cliEntry, ...args], {
     cwd: projectDir,
     encoding: "utf-8",
-    env: {
-      ...process.env,
-      // Prevent global config from leaking into tests
-      HOME: projectDir,
-      ...options?.env,
-    },
-    timeout: 10_000,
+    env: buildTestEnv(options?.env),
+    timeout: CLI_PROCESS_TIMEOUT_MS,
   });
 }
 
@@ -31,8 +46,8 @@ function runStderr(args: string[], options?: { env?: Record<string, string> }): 
     const stdout = execFileSync("node", [cliEntry, ...args], {
       cwd: projectDir,
       encoding: "utf-8",
-      env: { ...process.env, HOME: projectDir, ...options?.env },
-      timeout: 10_000,
+      env: buildTestEnv(options?.env),
+      timeout: CLI_PROCESS_TIMEOUT_MS,
     });
     return { stdout, stderr: "", exitCode: 0 };
   } catch (e: unknown) {
@@ -61,7 +76,7 @@ describe("CLI integration", () => {
     it("prints version number", () => {
       const output = run(["--version"]);
       expect(output.trim()).toMatch(/^\d+\.\d+\.\d+$/);
-    });
+    }, CLI_PROCESS_TIMEOUT_MS);
   });
 
   describe("inkos --help", () => {
@@ -181,6 +196,15 @@ describe("CLI integration", () => {
       const config = JSON.parse(raw);
       expect(config.inputGovernanceMode).toBe("v2");
     });
+
+    it("sets long-form writing review retries", async () => {
+      const output = run(["config", "set", "writing.reviewRetries", "3"]);
+      expect(output).toContain("Set writing.reviewRetries = 3");
+
+      const raw = await readFile(join(projectDir, "inkos.json"), "utf-8");
+      const config = JSON.parse(raw);
+      expect(config.writing.reviewRetries).toBe(3);
+    });
   });
 
   describe("inkos config show", () => {
@@ -192,52 +216,64 @@ describe("CLI integration", () => {
   });
 
   describe("inkos interact", () => {
-    it("returns structured JSON for shared interaction mode switches", async () => {
+    it("returns the agent-session JSON contract for natural-language interactions", async () => {
       const initialized = await stat(join(projectDir, "inkos.json")).then(() => true).catch(() => false);
       if (!initialized) run(["init"]);
-      await writeFile(
-        join(projectDir, ".env"),
-        Object.entries(failingLlmEnv).map(([key, value]) => `${key}=${value}`).join("\n"),
-        "utf-8",
-      );
-      const output = run(["interact", "--json", "--message", "切换到全自动"]);
-      const data = JSON.parse(output);
+      const envPath = join(projectDir, ".env");
+      const originalEnv = await readFile(envPath, "utf-8");
+      try {
+        await writeFile(
+          envPath,
+          Object.entries(failingLlmEnv).map(([key, value]) => `${key}=${value}`).join("\n"),
+          "utf-8",
+        );
+        const output = run(["interact", "--json", "--message", "切换到全自动"]);
+        const data = JSON.parse(output);
 
-      expect(data.request.intent).toBe("switch_mode");
-      expect(data.request.mode).toBe("auto");
-      expect(data.session.automationMode).toBe("auto");
-    });
+        expect(data.request).toBeUndefined();
+        expect(data.responseText).toEqual(expect.any(String));
+        expect(data.session).toEqual(expect.objectContaining({
+          sessionKind: "chat",
+        }));
+      } finally {
+        await writeFile(envPath, originalEnv, "utf-8");
+      }
+    }, CLI_PROCESS_TIMEOUT_MS);
 
     it("binds the requested book when interact is called with --book", async () => {
       const initialized = await stat(join(projectDir, "inkos.json")).then(() => true).catch(() => false);
       if (!initialized) run(["init"]);
-      await writeFile(
-        join(projectDir, ".env"),
-        Object.entries(failingLlmEnv).map(([key, value]) => `${key}=${value}`).join("\n"),
-        "utf-8",
-      );
-      const state = new StateManager(projectDir);
-      await state.saveBookConfig("harbor", {
-        id: "harbor",
-        title: "Harbor",
-        platform: "tomato",
-        genre: "other",
-        status: "active",
-        targetChapters: 20,
-        chapterWordCount: 3000,
-        createdAt: "2026-04-07T00:00:00.000Z",
-        updatedAt: "2026-04-07T00:00:00.000Z",
-      });
+      const envPath = join(projectDir, ".env");
+      const originalEnv = await readFile(envPath, "utf-8");
+      try {
+        await writeFile(
+          envPath,
+          Object.entries(failingLlmEnv).map(([key, value]) => `${key}=${value}`).join("\n"),
+          "utf-8",
+        );
+        const state = new StateManager(projectDir);
+        await state.saveBookConfig("harbor", {
+          id: "harbor",
+          title: "Harbor",
+          platform: "tomato",
+          genre: "other",
+          status: "active",
+          targetChapters: 20,
+          chapterWordCount: 3000,
+          createdAt: "2026-04-07T00:00:00.000Z",
+          updatedAt: "2026-04-07T00:00:00.000Z",
+        });
 
-      const output = run(["interact", "--json", "--book", "harbor", "--message", "/books"]);
-      const data = JSON.parse(output);
+        const output = run(["interact", "--json", "--book", "harbor", "--message", "/books"]);
+        const data = JSON.parse(output);
 
-      expect(data.session.activeBookId).toBe("harbor");
-
-      // Clean up harbor book and session so subsequent tests start with an empty project
-      await rm(join(projectDir, "books", "harbor"), { recursive: true, force: true });
-      await rm(join(projectDir, ".inkos-session.json"), { force: true }).catch(() => {});
-    });
+        expect(data.session.activeBookId).toBe("harbor");
+      } finally {
+        await writeFile(envPath, originalEnv, "utf-8");
+        await rm(join(projectDir, "books", "harbor"), { recursive: true, force: true });
+        await rm(join(projectDir, ".inkos-session.json"), { force: true }).catch(() => {});
+      }
+    }, CLI_PROCESS_TIMEOUT_MS);
   });
 
   describe("inkos config set-model", () => {
@@ -305,7 +341,7 @@ describe("CLI integration", () => {
       expect(exitCode).not.toBe(0);
       expect(stderr).toContain("Failed to create book");
       await expect(stat(staleDir)).rejects.toThrow();
-    });
+    }, CLI_PROCESS_TIMEOUT_MS);
   });
 
   describe("inkos status", () => {
@@ -409,7 +445,7 @@ describe("CLI integration", () => {
 
       const json = JSON.parse(run(["status", "degraded-status", "--json"]));
       expect(json.books[0]?.degraded).toBe(1);
-    });
+    }, DOUBLE_CLI_INVOCATION_TEST_TIMEOUT_MS);
 
     it("shows a migration hint for legacy pre-v0.6 books", async () => {
       const bookDir = join(projectDir, "books", "legacy-status-hint");
@@ -509,7 +545,7 @@ describe("CLI integration", () => {
 
       const json = JSON.parse(run(["status", bookId, "--json"]));
       expect(json.books[0]?.chapters).toBe(1);
-    });
+    }, DOUBLE_CLI_INVOCATION_TEST_TIMEOUT_MS);
   });
 
   describe("inkos doctor", () => {
@@ -541,7 +577,7 @@ describe("CLI integration", () => {
 
       await expect(readFile(join(projectDir, ".nvmrc"), "utf-8")).resolves.toBe("22\n");
       await expect(readFile(join(projectDir, ".node-version"), "utf-8")).resolves.toBe("22\n");
-    });
+    }, CLI_PROCESS_TIMEOUT_MS);
 
     it("treats localhost OpenAI-compatible endpoints as API-key optional", async () => {
       await stat(join(projectDir, "inkos.json")).catch(() => {
@@ -853,6 +889,43 @@ describe("CLI integration", () => {
         await writeFile(join(bookDir, "chapters", "index.json"), "[]", "utf-8");
       });
 
+      const plannedGoal = "Ignore the guild chase and focus on the mentor conflict.";
+      const intentMarkdown = [
+        "# Chapter Intent",
+        "",
+        "## Goal",
+        plannedGoal,
+        "",
+        "## Outline Node",
+        "(not found)",
+        "",
+        "## Must Keep",
+        "- none",
+        "",
+        "## Must Avoid",
+        "- none",
+        "",
+        "## Style Emphasis",
+        "- none",
+        "",
+        "## Conflicts",
+        "- none",
+        "",
+        "## Chapter Brief",
+        "- chapterType: 推进",
+        "- isGoldenOpening: false",
+        "",
+        "### Beat Outline",
+        "- opening: Track the merchant guild trail",
+        "",
+        "### Hook Plan",
+        "- none",
+        "",
+        "### Props And Setting",
+        "- none",
+        "",
+      ].join("\n");
+
       await Promise.all([
         writeFile(join(storyDir, "author_intent.md"), "# Author Intent\n\nKeep the story centered on the mentor conflict.\n", "utf-8"),
         writeFile(join(storyDir, "current_focus.md"), "# Current Focus\n\nBring focus back to the mentor conflict.\n", "utf-8"),
@@ -861,11 +934,12 @@ describe("CLI integration", () => {
         writeFile(join(storyDir, "book_rules.md"), "---\nprohibitions:\n  - Do not reveal the mastermind\n---\n\n# Book Rules\n", "utf-8"),
         writeFile(join(storyDir, "current_state.md"), "# Current State\n\n- Lin Yue still hides the broken oath token.\n", "utf-8"),
         writeFile(join(storyDir, "pending_hooks.md"), "# Pending Hooks\n\n- Why the mentor vanished after the trial.\n", "utf-8"),
+        writeFile(join(storyDir, "runtime", "chapter-0001.intent.md"), intentMarkdown, "utf-8"),
       ]);
     });
 
-    it("runs plan chapter and returns the generated intent path in JSON mode", async () => {
-      const output = run(["plan", "chapter", "cli-book", "--json", "--context", "Ignore the guild chase and focus on the mentor conflict."]);
+    it("loads a pre-planned intent and returns the generated intent path in JSON mode", async () => {
+      const output = run(["compose", "chapter", "cli-book", "--json"]);
       const data = JSON.parse(output);
 
       expect(data.bookId).toBe("cli-book");
@@ -889,16 +963,14 @@ describe("CLI integration", () => {
       await expect(stat(join(projectDir, "books", "cli-book", data.tracePath))).resolves.toBeTruthy();
     });
 
-    it("reuses the planned intent when compose runs without a new context", async () => {
-      const plannedGoal = "Ignore the guild chase and focus on the mentor conflict.";
-      run(["plan", "chapter", "cli-book", "--context", plannedGoal]);
-
+    it("re-plans from outline when compose runs without a new context (Phase 1: persisted plans disabled)", async () => {
       const output = run(["compose", "chapter", "cli-book", "--json"]);
       const data = JSON.parse(output);
       const intentMarkdown = await readFile(join(projectDir, "books", "cli-book", data.intentPath), "utf-8");
 
-      expect(data.goal).toBe(plannedGoal);
-      expect(intentMarkdown).toContain(plannedGoal);
+      expect(typeof data.goal).toBe("string");
+      expect(data.goal.length).toBeGreaterThan(0);
+      expect(intentMarkdown).toContain(data.goal);
     });
   });
 

@@ -8,7 +8,7 @@ import type { GenreProfile } from "../models/genre-profile.js";
 import { ArchitectAgent, type ArchitectOutput } from "../agents/architect.js";
 import { FoundationReviewerAgent } from "../agents/foundation-reviewer.js";
 import { PlannerAgent, type PlanChapterOutput } from "../agents/planner.js";
-import { ComposerAgent } from "../agents/composer.js";
+import { ComposerAgent, composeGovernedChapter, contextBudgetFromClient, type ComposeChapterOutput } from "../agents/composer.js";
 import { WriterAgent, type WriteChapterInput, type WriteChapterOutput } from "../agents/writer.js";
 import { LengthNormalizerAgent } from "../agents/length-normalizer.js";
 import { ChapterAnalyzerAgent } from "../agents/chapter-analyzer.js";
@@ -28,9 +28,17 @@ import type { AgentContext } from "../agents/base.js";
 import type { AuditResult, AuditIssue } from "../agents/continuity.js";
 import type { RadarResult } from "../agents/radar.js";
 import type { LengthSpec, LengthTelemetry } from "../models/length-governance.js";
-import type { ContextPackage, RuleStack } from "../models/input-governance.js";
-import { buildLengthSpec, countChapterLength, formatLengthCount, isOutsideHardRange, isOutsideSoftRange, resolveLengthCountingMode, type LengthLanguage } from "../utils/length-metrics.js";
+import type { ChapterMemo, ContextPackage, RuleStack } from "../models/input-governance.js";
+import type { ContextCompressionCallback } from "../models/context-compression.js";
+import { buildLengthSpec, countChapterLength, formatLengthCount, isOutsideHardRange, resolveLengthCountingMode, type LengthLanguage } from "../utils/length-metrics.js";
 import { analyzeLongSpanFatigue } from "../utils/long-span-fatigue.js";
+import { buildWritingMethodologySection } from "../utils/writing-methodology.js";
+import {
+  isNewLayoutBook,
+  readCharacterContext,
+  readStoryFrame,
+  readVolumeMap,
+} from "../utils/outline-paths.js";
 import { loadNarrativeMemorySeed, loadSnapshotCurrentStateFacts } from "../state/runtime-state-store.js";
 import { rewriteStructuredStateFromMarkdown } from "../state/state-bootstrap.js";
 import { readFile, readdir, writeFile, mkdir, rename, rm, stat } from "node:fs/promises";
@@ -43,7 +51,7 @@ import {
 import { persistChapterArtifacts } from "./chapter-persistence.js";
 import { runChapterReviewCycle } from "./chapter-review-cycle.js";
 import { validateChapterTruthPersistence } from "./chapter-truth-validation.js";
-import { loadPersistedPlan, relativeToBookDir } from "./persisted-governed-plan.js";
+import { loadPersistedPlan, relativeToBookDir, savePersistedPlan } from "./persisted-governed-plan.js";
 
 const SEQUENCE_LEVEL_CATEGORIES = new Set([
   "Pacing Monotony", "节奏单调",
@@ -58,11 +66,199 @@ function isSequenceLevelCategory(category: string): boolean {
   return SEQUENCE_LEVEL_CATEGORIES.has(category);
 }
 
+interface ImportFoundationSourceOptions {
+  readonly maxFullTextChars?: number;
+  readonly chapterExcerptChars?: number;
+  readonly titleCatalogChars?: number;
+  readonly edgeChapterCount?: number;
+  readonly middleAnchorCount?: number;
+}
+
+const DEFAULT_IMPORT_FOUNDATION_MAX_FULL_TEXT_CHARS = 80_000;
+const DEFAULT_IMPORT_CHAPTER_EXCERPT_CHARS = 6_000;
+const DEFAULT_IMPORT_TITLE_CATALOG_CHARS = 24_000;
+const DEFAULT_IMPORT_EDGE_CHAPTER_COUNT = 4;
+const DEFAULT_IMPORT_MIDDLE_ANCHOR_COUNT = 8;
+
+function formatImportedChapter(
+  chapter: { readonly title: string; readonly content: string },
+  index: number,
+  language: LengthLanguage,
+  content = chapter.content,
+): string {
+  return language === "en"
+    ? `Chapter ${index + 1}: ${chapter.title}\n\n${content}`
+    : `第${index + 1}章 ${chapter.title}\n\n${content}`;
+}
+
+function estimateImportFullTextLength(
+  chapters: ReadonlyArray<{ readonly title: string; readonly content: string }>,
+): number {
+  return chapters.reduce((total, chapter) => total + chapter.title.length + chapter.content.length + 24, 0);
+}
+
+function excerptHeadTail(text: string, maxChars: number, language: LengthLanguage): string {
+  const clean = text.trim();
+  if (clean.length <= maxChars) return clean;
+  const headChars = Math.max(200, Math.floor(maxChars * 0.6));
+  const tailChars = Math.max(200, maxChars - headChars);
+  const omitted = clean.length - headChars - tailChars;
+  const marker = language === "en"
+    ? `\n\n[... ${omitted} chars omitted for import-context budget ...]\n\n`
+    : `\n\n【中间省略 ${omitted} 字，用于控制导入上下文预算】\n\n`;
+  return `${clean.slice(0, headChars).trimEnd()}${marker}${clean.slice(-tailChars).trimStart()}`;
+}
+
+function pickImportAnchorIndexes(
+  chapterCount: number,
+  edgeChapterCount: number,
+  middleAnchorCount: number,
+): ReadonlyArray<number> {
+  const selected = new Set<number>();
+  for (let i = 0; i < Math.min(edgeChapterCount, chapterCount); i++) selected.add(i);
+  for (let i = Math.max(0, chapterCount - edgeChapterCount); i < chapterCount; i++) selected.add(i);
+
+  const middleStart = Math.min(edgeChapterCount, chapterCount);
+  const middleEnd = Math.max(middleStart, chapterCount - edgeChapterCount);
+  const middleSize = middleEnd - middleStart;
+  const anchors = Math.min(middleAnchorCount, middleSize);
+  for (let i = 0; i < anchors; i++) {
+    const offset = Math.floor(((i + 1) * middleSize) / (anchors + 1));
+    selected.add(Math.min(chapterCount - 1, middleStart + offset));
+  }
+
+  return [...selected].sort((a, b) => a - b);
+}
+
+function buildTitleCatalog(
+  chapters: ReadonlyArray<{ readonly title: string; readonly content: string }>,
+  language: LengthLanguage,
+  maxChars: number,
+): string {
+  const lines = chapters.map((chapter, index) =>
+    language === "en"
+      ? `- Chapter ${index + 1}: ${chapter.title} (${chapter.content.length} chars)`
+      : `- 第${index + 1}章：${chapter.title}（${chapter.content.length}字）`,
+  );
+  const joined = lines.join("\n");
+  if (joined.length <= maxChars) return joined;
+
+  const headBudget = Math.floor(maxChars * 0.55);
+  const tailBudget = maxChars - headBudget;
+  const head: string[] = [];
+  const tail: string[] = [];
+  let headChars = 0;
+  let tailChars = 0;
+  for (const line of lines) {
+    if (headChars + line.length + 1 > headBudget) break;
+    head.push(line);
+    headChars += line.length + 1;
+  }
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!;
+    if (tailChars + line.length + 1 > tailBudget) break;
+    tail.unshift(line);
+    tailChars += line.length + 1;
+  }
+  const omitted = lines.length - head.length - tail.length;
+  const marker = language === "en"
+    ? `- ... ${omitted} chapter titles omitted ...`
+    : `- ……中间 ${omitted} 个章节标题省略……`;
+  return [...head, marker, ...tail].join("\n");
+}
+
+/**
+ * Build the architect external-context for a side-story (番外) foundation: frame
+ * it as a companion work that reuses the parent canon's cast/world but tells an
+ * independent side plot, and attach the parent canon as reference material.
+ */
+export function buildSpinoffFoundationContext(
+  parentCanon: string,
+  direction: string | undefined,
+  language: "zh" | "en",
+): string {
+  const dir = direction?.trim();
+  if (language === "en") {
+    return [
+      "## This is a SIDE-STORY (番外)",
+      "Reuse the established characters, world, and rules from the parent canon below. Tell an INDEPENDENT side plot — a bonus arc, a character backstory, or a what-if — that does NOT advance or contradict the parent work's main storyline.",
+      dir ? `\n## Side-story direction\n${dir}` : "",
+      `\n## Parent canon (reuse these characters and settings)\n${parentCanon}`,
+    ].filter(Boolean).join("\n");
+  }
+  return [
+    "## 这是一部番外",
+    "复用下方正传正典里已确立的角色、世界观与规则。讲一个独立的侧篇故事——支线、角色前传或 what-if——不要推进或违背正传的主线剧情。",
+    dir ? `\n## 番外方向\n${dir}` : "",
+    `\n## 正传正典（复用以下角色与设定）\n${parentCanon}`,
+  ].filter(Boolean).join("\n");
+}
+
+export function buildImportFoundationSource(
+  chapters: ReadonlyArray<{ readonly title: string; readonly content: string }>,
+  language: LengthLanguage,
+  options: ImportFoundationSourceOptions = {},
+): string {
+  const maxFullTextChars = options.maxFullTextChars ?? DEFAULT_IMPORT_FOUNDATION_MAX_FULL_TEXT_CHARS;
+  const chapterExcerptChars = options.chapterExcerptChars ?? DEFAULT_IMPORT_CHAPTER_EXCERPT_CHARS;
+  const titleCatalogChars = options.titleCatalogChars ?? DEFAULT_IMPORT_TITLE_CATALOG_CHARS;
+  const edgeChapterCount = options.edgeChapterCount ?? DEFAULT_IMPORT_EDGE_CHAPTER_COUNT;
+  const middleAnchorCount = options.middleAnchorCount ?? DEFAULT_IMPORT_MIDDLE_ANCHOR_COUNT;
+
+  if (estimateImportFullTextLength(chapters) <= maxFullTextChars) {
+    return chapters.map((chapter, index) => formatImportedChapter(chapter, index, language)).join("\n\n---\n\n");
+  }
+
+  const anchorIndexes = pickImportAnchorIndexes(chapters.length, edgeChapterCount, middleAnchorCount);
+  const header = language === "en"
+    ? [
+        "## Import foundation source package",
+        "",
+        `The imported book has ${chapters.length} chapters. To avoid overflowing the LLM context, this package keeps the opening chapters, ending/continuation point, selected middle anchors, and a capped title catalog. Full chapters will still be replayed sequentially after foundation generation to rebuild truth files.`,
+      ].join("\n")
+    : [
+        "## 导入基础设定压缩资料包",
+        "",
+        `本次导入共 ${chapters.length} 章。为避免超出 LLM 上下文，这里保留开篇、结尾续写点、少量中段锚点和标题目录；完整章节将在后续顺序回放中逐章分析并沉淀 truth files。`,
+      ].join("\n");
+  const catalogTitle = language === "en" ? "## Capped chapter title catalog" : "## 章节标题目录（截断）";
+  const anchorsTitle = language === "en" ? "## Source excerpts for architecture" : "## 用于反推基础设定的正文摘录";
+  const anchorText = anchorIndexes
+    .map((index) => {
+      const chapter = chapters[index]!;
+      return formatImportedChapter(
+        chapter,
+        index,
+        language,
+        excerptHeadTail(chapter.content, chapterExcerptChars, language),
+      );
+    })
+    .join("\n\n---\n\n");
+
+  return [
+    header,
+    "",
+    catalogTitle,
+    buildTitleCatalog(chapters, language, titleCatalogChars),
+    "",
+    anchorsTitle,
+    anchorText,
+  ].join("\n");
+}
+
 export interface PipelineConfig {
   readonly client: LLMClient;
   readonly model: string;
   readonly projectRoot: string;
   readonly defaultLLMConfig?: LLMConfig;
+  readonly foundationReviewRetries?: number;
+  readonly writingReviewRetries?: number;
+  /**
+   * "auto" (default): writeNextChapter runs the audit→revise loop inline.
+   * "manual": stop right after the draft (no auto audit/revise) so review/revise
+   * become explicit, user-driven checkpoint actions — chapter write stays fast.
+   */
+  readonly chapterReviewMode?: "auto" | "manual";
   readonly notifyChannels?: ReadonlyArray<NotifyChannel>;
   readonly radarSources?: ReadonlyArray<RadarSource>;
   readonly externalContext?: string;
@@ -70,6 +266,7 @@ export interface PipelineConfig {
   readonly inputGovernanceMode?: InputGovernanceMode;
   readonly logger?: Logger;
   readonly onStreamProgress?: OnStreamProgress;
+  readonly onContextCompression?: ContextCompressionCallback;
 }
 
 export interface TokenUsageSummary {
@@ -260,9 +457,10 @@ export class PipelineRunner {
     readonly styleGuide?: string;
     readonly language: "zh" | "en";
     readonly stageLanguage: LengthLanguage;
+    readonly targetChapters?: number;
     readonly maxRetries?: number;
   }): Promise<ArchitectOutput> {
-    const maxRetries = params.maxRetries ?? 2;
+    const maxRetries = params.maxRetries ?? this.config.foundationReviewRetries ?? 2;
     let foundation = await params.generate();
 
     for (let attempt = 0; attempt < maxRetries; attempt++) {
@@ -277,6 +475,7 @@ export class PipelineRunner {
         sourceCanon: params.sourceCanon,
         styleGuide: params.styleGuide,
         language: params.language,
+        targetChapters: params.targetChapters,
       });
 
       this.config.logger?.info(
@@ -305,6 +504,7 @@ export class PipelineRunner {
       sourceCanon: params.sourceCanon,
       styleGuide: params.styleGuide,
       language: params.language,
+      targetChapters: params.targetChapters,
     });
     this.config.logger?.info(
       `Foundation final review: ${finalReview.totalScore}/100 ${finalReview.passed ? "PASSED" : "ACCEPTED (max retries)"}`,
@@ -393,11 +593,12 @@ export class PipelineRunner {
         : base?.apiKey ?? "";
       client = createLLMClient({
         provider,
+        service: base?.service ?? "custom",
+        configSource: base?.configSource ?? "env",
         baseUrl: override.baseUrl,
         apiKey,
         model: override.model,
         temperature: base?.temperature ?? 0.7,
-        maxTokens: base?.maxTokens ?? 8192,
         thinkingBudget: base?.thinkingBudget ?? 0,
         apiFormat,
         stream,
@@ -417,6 +618,10 @@ export class PipelineRunner {
       logger: this.config.logger?.child(agent),
       onStreamProgress: this.config.onStreamProgress,
     };
+  }
+
+  public createAgentContext(agent: string, bookId?: string): AgentContext {
+    return this.agentCtxFor(agent, bookId);
   }
 
   private async pathExists(path: string): Promise<boolean> {
@@ -450,6 +655,7 @@ export class PipelineRunner {
       `.tmp-book-create-${book.id}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
     );
     const stageLanguage = await this.resolveBookLanguage(book);
+    const effectiveExternalContext = options.externalContext ?? this.config.externalContext;
 
     this.logStage(stageLanguage, { zh: "生成基础设定", en: "generating foundation" });
     const { profile: gp } = await this.loadGenreProfile(book.genre);
@@ -458,13 +664,14 @@ export class PipelineRunner {
     const foundation = await this.generateAndReviewFoundation({
       generate: (reviewFeedback) => architect.generateFoundation(
         book,
-        options.externalContext ?? this.config.externalContext,
+        effectiveExternalContext,
         reviewFeedback,
       ),
       reviewer,
       mode: "original",
       language: resolvedLanguage,
       stageLanguage,
+      targetChapters: book.targetChapters,
     });
     try {
       this.logStage(stageLanguage, { zh: "保存书籍配置", en: "saving book config" });
@@ -478,11 +685,17 @@ export class PipelineRunner {
         book.language ?? gp.language,
       );
 
+      if (effectiveExternalContext && effectiveExternalContext.trim().length > 0) {
+        const storyDir = join(stagingBookDir, "story");
+        await mkdir(storyDir, { recursive: true });
+        await writeFile(join(storyDir, "brief.md"), effectiveExternalContext, "utf-8");
+      }
+
       this.logStage(stageLanguage, { zh: "初始化控制文档", en: "initializing control documents" });
       await this.state.ensureControlDocumentsAt(
         stagingBookDir,
         book.language ?? gp.language,
-        options.authorIntent ?? this.config.externalContext,
+        options.authorIntent ?? effectiveExternalContext,
       );
       if (options.currentFocus?.trim()) {
         await writeFile(
@@ -508,6 +721,146 @@ export class PipelineRunner {
     } catch (error) {
       await rm(stagingBookDir, { recursive: true, force: true }).catch(() => undefined);
       throw error;
+    }
+  }
+
+  /**
+   * Revise an existing book foundation without touching runtime chapter state.
+   *
+   * Legacy books read the flat foundation files as source. Phase 5+ books read
+   * the authoritative outline/ and roles/ files instead of the compatibility
+   * shims, otherwise large role/story details can be lost during rewrite.
+   */
+  async reviseFoundation(bookId: string, feedback: string): Promise<void> {
+    const bookDir = this.state.bookDir(bookId);
+    const storyDir = join(bookDir, "story");
+    const isPhase5 = await isNewLayoutBook(bookDir);
+
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const backupTag = isPhase5 ? "phase5" : "phase4";
+    const backupDir = join(storyDir, `.backup-${backupTag}-${timestamp}`);
+    await mkdir(backupDir, { recursive: true });
+
+    const flatFiles = ["story_bible.md", "volume_outline.md", "book_rules.md", "character_matrix.md"];
+    for (const fileName of flatFiles) {
+      try {
+        const content = await readFile(join(storyDir, fileName), "utf-8");
+        await writeFile(join(backupDir, fileName), content, "utf-8");
+      } catch {
+        // Missing legacy shim files are fine for partially migrated books.
+      }
+    }
+
+    if (isPhase5) {
+      await this.copyDirShallow(join(storyDir, "outline"), join(backupDir, "outline"));
+      await this.copyDirRecursive(join(storyDir, "roles"), join(backupDir, "roles"));
+    }
+
+    const book = await this.state.loadBookConfig(bookId);
+    let oldStoryBible: string;
+    let oldVolumeOutline: string;
+    let oldBookRules: string;
+    let oldCharacterMatrix: string;
+
+    if (isPhase5) {
+      [oldStoryBible, oldVolumeOutline, oldCharacterMatrix] = await Promise.all([
+        readStoryFrame(bookDir),
+        readVolumeMap(bookDir),
+        readCharacterContext(bookDir),
+      ]);
+      oldBookRules = await readFile(join(storyDir, "book_rules.md"), "utf-8").catch(() => "");
+    } else {
+      [oldStoryBible, oldVolumeOutline, oldBookRules, oldCharacterMatrix] = await Promise.all([
+        readFile(join(storyDir, "story_bible.md"), "utf-8").catch(() => ""),
+        readFile(join(storyDir, "volume_outline.md"), "utf-8").catch(() => ""),
+        readFile(join(storyDir, "book_rules.md"), "utf-8").catch(() => ""),
+        readFile(join(storyDir, "character_matrix.md"), "utf-8").catch(() => ""),
+      ]);
+    }
+
+    const architect = new ArchitectAgent(this.agentCtxFor("architect", bookId));
+    const foundation = await architect.generateFoundation(book, undefined, undefined, {
+      reviseFrom: {
+        storyBible: oldStoryBible,
+        volumeOutline: oldVolumeOutline,
+        bookRules: oldBookRules,
+        characterMatrix: oldCharacterMatrix,
+        userFeedback: feedback,
+      },
+    });
+
+    const reviewer = new FoundationReviewerAgent(this.agentCtxFor("foundation-reviewer", bookId));
+    const resolvedLanguage = (book.language ?? "zh") === "en" ? "en" as const : "zh" as const;
+    try {
+      const review = await reviewer.review({
+        foundation,
+        mode: "original",
+        language: resolvedLanguage,
+        targetChapters: book.targetChapters,
+      } as Parameters<FoundationReviewerAgent["review"]>[0]);
+      if (!review.passed) {
+        this.config.logger?.warn?.(
+          `[reviseFoundation] Foundation review did not pass; accepting rewrite. Feedback: ${review.overallFeedback ?? ""}`,
+        );
+      }
+    } catch (error) {
+      this.config.logger?.warn?.(
+        `[reviseFoundation] Foundation review failed and was skipped: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+
+    const outlineDir = join(storyDir, "outline");
+    await mkdir(outlineDir, { recursive: true });
+    await mkdir(join(storyDir, "roles", "主要角色"), { recursive: true });
+    await mkdir(join(storyDir, "roles", "次要角色"), { recursive: true });
+
+    const { profile: gp } = await this.loadGenreProfile(book.genre);
+    await architect.writeFoundationFiles(
+      bookDir,
+      foundation,
+      gp.numericalSystem,
+      book.language ?? gp.language,
+      "revise",
+    );
+  }
+
+  private async copyDirShallow(src: string, dest: string): Promise<void> {
+    try {
+      await mkdir(dest, { recursive: true });
+      const entries = await readdir(src);
+      await Promise.all(entries.map(async (entry) => {
+        try {
+          const content = await readFile(join(src, entry), "utf-8");
+          await writeFile(join(dest, entry), content, "utf-8");
+        } catch {
+          // Skip unreadable files.
+        }
+      }));
+    } catch {
+      // Source directory does not exist.
+    }
+  }
+
+  private async copyDirRecursive(src: string, dest: string): Promise<void> {
+    try {
+      await mkdir(dest, { recursive: true });
+      const entries = await readdir(src, { withFileTypes: true });
+      for (const entry of entries) {
+        const srcPath = join(src, entry.name);
+        const destPath = join(dest, entry.name);
+        if (entry.isDirectory()) {
+          await this.copyDirRecursive(srcPath, destPath);
+        } else if (entry.isFile()) {
+          try {
+            const content = await readFile(srcPath, "utf-8");
+            await writeFile(destPath, content, "utf-8");
+          } catch {
+            // Skip unreadable files.
+          }
+        }
+      }
+    } catch {
+      // Source directory does not exist.
     }
   }
 
@@ -565,6 +918,7 @@ export class PipelineRunner {
       sourceCanon: fanficCanon,
       language: resolvedLanguage,
       stageLanguage,
+      targetChapters: book.targetChapters,
     });
     this.logStage(stageLanguage, { zh: "写入基础设定文件", en: "writing foundation files" });
     await architect.writeFoundationFiles(
@@ -587,6 +941,71 @@ export class PipelineRunner {
     await mkdir(join(bookDir, "chapters"), { recursive: true });
     await this.state.saveChapterIndex(book.id, []);
     await this.state.snapshotState(book.id, 0);
+  }
+
+  /**
+   * Create a side-story (番外) book: a standalone companion that inherits a
+   * parent book's world/characters via parent_canon.md, but tells an INDEPENDENT
+   * side plot that does not advance or contradict the parent's main-line state.
+   * Reuses importCanon (which already builds the parent-canon reference for
+   * side-story writing) + the standard original-foundation architect path.
+   */
+  async initSpinoffBook(book: BookConfig, parentBookId: string, direction?: string): Promise<void> {
+    const bookDir = this.state.bookDir(book.id);
+    const stageLanguage = await this.resolveBookLanguage(book);
+
+    this.logStage(stageLanguage, { zh: "保存书籍配置", en: "saving book config" });
+    await this.state.saveBookConfig(book.id, book);
+
+    this.logStage(stageLanguage, { zh: "导入正传正典参照", en: "importing parent canon" });
+    const parentCanon = await this.importCanon(book.id, parentBookId);
+
+    const architect = new ArchitectAgent(this.agentCtxFor("architect", book.id));
+    const reviewer = new FoundationReviewerAgent(this.agentCtxFor("foundation-reviewer", book.id));
+    const { profile: gp } = await this.loadGenreProfile(book.genre);
+    const resolvedLanguage = (book.language ?? gp.language) === "en" ? "en" as const : "zh" as const;
+    const spinoffContext = buildSpinoffFoundationContext(parentCanon, direction, resolvedLanguage);
+
+    this.logStage(stageLanguage, { zh: "生成番外基础设定", en: "generating side-story foundation" });
+    const foundation = await this.generateAndReviewFoundation({
+      generate: (reviewFeedback) => architect.generateFoundation(book, spinoffContext, reviewFeedback),
+      reviewer,
+      mode: "original",
+      language: resolvedLanguage,
+      stageLanguage,
+      targetChapters: book.targetChapters,
+    });
+
+    this.logStage(stageLanguage, { zh: "写入基础设定文件", en: "writing foundation files" });
+    await architect.writeFoundationFiles(bookDir, foundation, gp.numericalSystem, book.language ?? gp.language);
+
+    this.logStage(stageLanguage, { zh: "初始化控制文档", en: "initializing control documents" });
+    await this.state.ensureControlDocuments(book.id, direction?.trim() || this.config.externalContext);
+
+    this.logStage(stageLanguage, { zh: "创建初始快照", en: "creating initial snapshot" });
+    await mkdir(join(bookDir, "chapters"), { recursive: true });
+    await this.state.saveChapterIndex(book.id, []);
+    await this.state.snapshotState(book.id, 0);
+  }
+
+  /**
+   * Create an imitation (仿写) book: an ORIGINAL story whose prose imitates the
+   * voice of a reference work. The architect builds an original foundation from
+   * the user's story idea; the reference text becomes the book's style_guide.md
+   * so the writer mimics its style. The style guide is mandatory here (imitation
+   * is the whole point), so a failure to generate it surfaces rather than being
+   * silently skipped.
+   */
+  async initImitationBook(
+    book: BookConfig,
+    referenceText: string,
+    storyIdea: string,
+    sourceName?: string,
+  ): Promise<void> {
+    await this.initBook(book, { externalContext: storyIdea });
+    const stageLanguage = await this.resolveBookLanguage(book);
+    this.logStage(stageLanguage, { zh: "提取参考作品风格指纹", en: "extracting reference style fingerprint" });
+    await this.generateStyleGuide(book.id, referenceText, sourceName?.trim() || "reference");
   }
 
   /** Write a single draft chapter. Saves chapter file + truth files + index + snapshot. */
@@ -693,7 +1112,11 @@ export class PipelineRunner {
         lengthTelemetry,
         ...(draftOutput.tokenUsage ? { tokenUsage: draftOutput.tokenUsage } : {}),
       };
-      await this.state.saveChapterIndex(bookId, [...existingIndex, newEntry]);
+      const existingIdx = existingIndex.findIndex((e) => e.number === chapterNumber);
+      const updatedIndex = existingIdx >= 0
+        ? existingIndex.map((e, i) => i === existingIdx ? newEntry : e)
+        : [...existingIndex, newEntry];
+      await this.state.saveChapterIndex(bookId, updatedIndex);
       await this.markBookActiveIfNeeded(bookId);
 
       // Snapshot
@@ -740,7 +1163,7 @@ export class PipelineRunner {
       chapterNumber,
       intentPath: relativeToBookDir(bookDir, plan.runtimePath),
       goal: plan.intent.goal,
-      conflicts: plan.intent.conflicts.map((conflict) => `${conflict.type}: ${conflict.resolution}`),
+      conflicts: [],
     };
   }
 
@@ -764,7 +1187,7 @@ export class PipelineRunner {
       chapterNumber,
       intentPath: relativeToBookDir(bookDir, plan.runtimePath),
       goal: plan.intent.goal,
-      conflicts: plan.intent.conflicts.map((conflict) => `${conflict.type}: ${conflict.resolution}`),
+      conflicts: [],
       contextPath: relativeToBookDir(bookDir, composed.contextPath),
       ruleStackPath: relativeToBookDir(bookDir, composed.ruleStackPath),
       tracePath: relativeToBookDir(bookDir, composed.tracePath),
@@ -879,6 +1302,7 @@ export class PipelineRunner {
         auditOptions: reviseControlInput
           ? {
               chapterIntent: reviseControlInput.plan.intentMarkdown,
+              chapterMemo: reviseControlInput.plan.memo,
               contextPackage: reviseControlInput.composed.contextPackage,
               ruleStack: reviseControlInput.composed.ruleStack,
             }
@@ -920,6 +1344,8 @@ export class PipelineRunner {
         reviseControlInput
           ? {
               chapterIntent: reviseControlInput.plan.intentMarkdown,
+              chapterMemo: reviseControlInput.plan.memo,
+              chapterIntentData: reviseControlInput.plan.intent,
               contextPackage: reviseControlInput.composed.contextPackage,
               ruleStack: reviseControlInput.composed.ruleStack,
               lengthSpec,
@@ -947,6 +1373,7 @@ export class PipelineRunner {
           ? {
               temperature: 0,
               chapterIntent: reviseControlInput.plan.intentMarkdown,
+              chapterMemo: reviseControlInput.plan.memo,
               contextPackage: reviseControlInput.composed.contextPackage,
               ruleStack: reviseControlInput.composed.ruleStack,
               truthFileOverrides: {
@@ -1108,13 +1535,20 @@ export class PipelineRunner {
       }
     };
 
+    // Phase 5: prefer the new prose outline files; fall back to legacy paths.
+    const readOutline = async (newRel: string, legacyRel: string): Promise<string> => {
+      const preferred = await readSafe(join(storyDir, newRel));
+      if (preferred.trim() && preferred !== "(文件不存在)") return preferred;
+      return readSafe(join(storyDir, legacyRel));
+    };
+
     const [currentState, particleLedger, pendingHooks, storyBible, volumeOutline, bookRules] =
       await Promise.all([
         readSafe(join(storyDir, "current_state.md")),
         readSafe(join(storyDir, "particle_ledger.md")),
         readSafe(join(storyDir, "pending_hooks.md")),
-        readSafe(join(storyDir, "story_bible.md")),
-        readSafe(join(storyDir, "volume_outline.md")),
+        readOutline("outline/story_frame.md", "story_bible.md"),
+        readOutline("outline/volume_map.md", "volume_outline.md"),
         readSafe(join(storyDir, "book_rules.md")),
       ]);
 
@@ -1148,7 +1582,7 @@ export class PipelineRunner {
   async writeNextChapter(bookId: string, wordCount?: number, temperatureOverride?: number): Promise<ChapterPipelineResult> {
     const releaseLock = await this.state.acquireBookLock(bookId);
     try {
-      return await this._writeNextChapterLocked(bookId, wordCount, temperatureOverride);
+      return await this._writeNextChapterLocked(bookId, wordCount, temperatureOverride, this.config.externalContext);
     } finally {
       await releaseLock();
     }
@@ -1172,7 +1606,12 @@ export class PipelineRunner {
     }
   }
 
-  private async _writeNextChapterLocked(bookId: string, wordCount?: number, temperatureOverride?: number): Promise<ChapterPipelineResult> {
+  private async _writeNextChapterLocked(
+    bookId: string,
+    wordCount?: number,
+    temperatureOverride?: number,
+    externalContext?: string,
+  ): Promise<ChapterPipelineResult> {
     await this.state.ensureControlDocuments(bookId);
     const book = await this.state.loadBookConfig(bookId);
     const bookDir = this.state.bookDir(bookId);
@@ -1184,11 +1623,13 @@ export class PipelineRunner {
       book,
       bookDir,
       chapterNumber,
-      this.config.externalContext,
+      externalContext,
     );
     const reducedControlInput = writeInput.chapterIntent && writeInput.contextPackage && writeInput.ruleStack
       ? {
           chapterIntent: writeInput.chapterIntent,
+          chapterMemo: writeInput.chapterMemo,
+          chapterIntentData: writeInput.chapterIntentData,
           contextPackage: writeInput.contextPackage,
           ruleStack: writeInput.ruleStack,
         }
@@ -1199,6 +1640,13 @@ export class PipelineRunner {
       wordCount ?? book.chapterWordCount,
       pipelineLang,
     );
+    const {
+      normalizePostWriteSurface,
+      validatePostWrite: postWriteValidate,
+    } = await import("../agents/post-write-validator.js");
+    const { validateHookLedger } = await import("../utils/hook-ledger-validator.js");
+    const { readBookRules } = await import("../agents/rules-reader.js");
+    const parsedBookRules = (await readBookRules(bookDir))?.rules ?? null;
 
     // 1. Write chapter
     const writer = new WriterAgent(this.agentCtxFor("writer", bookId));
@@ -1216,40 +1664,112 @@ export class PipelineRunner {
 
     // Token usage accumulator
     let totalUsage: TokenUsageSummary = output.tokenUsage ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
-    const auditor = new ContinuityAuditor(this.agentCtxFor("auditor", bookId));
-    const reviewResult = await runChapterReviewCycle({
-      book: { genre: book.genre },
-      bookDir,
-      chapterNumber,
-      initialOutput: output,
-      reducedControlInput,
-      lengthSpec,
-      initialUsage: totalUsage,
-      createReviser: () => new ReviserAgent(this.agentCtxFor("reviser", bookId)),
-      auditor,
-      normalizeDraftLengthIfNeeded: (chapterContent) => this.normalizeDraftLengthIfNeeded({
-        bookId,
+    let finalContent: string;
+    let finalWordCount: number;
+    let revised: boolean;
+    let auditResult: AuditResult;
+    let postReviseCount: number;
+    let normalizeApplied: boolean;
+    let preAuditNormalizedWordCount: number | undefined;
+
+    if ((this.config.chapterReviewMode ?? "auto") === "manual") {
+      // C4a: write-only checkpoint. Stop right after the draft — skip the
+      // automatic audit→revise loop (which silently doubled chapter time when it
+      // fired). The user drives review / revise / accept afterwards.
+      this.logStage(stageLanguage, { zh: "写完即停（手动审查模式）", en: "draft written — stopping for manual review" });
+      finalContent = normalizePostWriteSurface(output.content, pipelineLang);
+      this.assertChapterContentNotEmpty(finalContent, chapterNumber, "manual write");
+      finalWordCount = countChapterLength(finalContent, lengthSpec.countingMode);
+      revised = false;
+      postReviseCount = 0;
+      normalizeApplied = finalContent !== output.content;
+      preAuditNormalizedWordCount = writerCount;
+      auditResult = {
+        passed: false,
+        issues: [],
+        summary: pipelineLang === "en"
+          ? "Not reviewed yet (manual mode: stopped after writing — run review when ready)."
+          : "尚未审查（手动模式：写完即停，需要时点“审查”）。",
+      };
+    } else {
+      const auditor = new ContinuityAuditor(this.agentCtxFor("auditor", bookId));
+      const reviewResult = await runChapterReviewCycle({
+        book: { genre: book.genre },
+        bookDir,
         chapterNumber,
-        chapterContent,
+        initialOutput: output,
+        reducedControlInput,
         lengthSpec,
-        chapterIntent: writeInput.chapterIntent,
-      }),
-      assertChapterContentNotEmpty: (content, stage) =>
-        this.assertChapterContentNotEmpty(content, chapterNumber, stage),
-      addUsage: PipelineRunner.addUsage,
-      restoreLostAuditIssues: (previous, next) => this.restoreLostAuditIssues(previous, next),
-      analyzeAITells,
-      analyzeSensitiveWords,
-      logWarn: (message) => this.logWarn(pipelineLang, message),
-      logStage: (message) => this.logStage(stageLanguage, message),
-    });
-    totalUsage = reviewResult.totalUsage;
-    let finalContent = reviewResult.finalContent;
-    let finalWordCount = reviewResult.finalWordCount;
-    let revised = reviewResult.revised;
-    let auditResult = reviewResult.auditResult;
-    const postReviseCount = reviewResult.postReviseCount;
-    const normalizeApplied = reviewResult.normalizeApplied;
+        initialUsage: totalUsage,
+        createReviser: () => new ReviserAgent(this.agentCtxFor("reviser", bookId)),
+        auditor,
+        normalizeDraftLengthIfNeeded: (chapterContent) => this.normalizeDraftLengthIfNeeded({
+          bookId,
+          chapterNumber,
+          chapterContent,
+          lengthSpec,
+          chapterIntent: writeInput.chapterIntent,
+        }),
+        normalizePostWriteSurface: (chapterContent) =>
+          normalizePostWriteSurface(chapterContent, pipelineLang),
+        assertChapterContentNotEmpty: (content, stage) =>
+          this.assertChapterContentNotEmpty(content, chapterNumber, stage),
+        addUsage: PipelineRunner.addUsage,
+        analyzeAITells: (content) => analyzeAITells(content, pipelineLang),
+        analyzeSensitiveWords: (content) => analyzeSensitiveWords(content, undefined, pipelineLang),
+        runPostWriteChecks: (content) => {
+          const baseIssues = postWriteValidate(content, gp, parsedBookRules, pipelineLang)
+            .filter((v) => v.severity === "error")
+            .map((v) => ({
+              severity: "critical" as const,
+              category: v.rule,
+              description: v.description,
+              suggestion: v.suggestion,
+            }));
+          // Phase 9-3: verify the draft acts on every hook the memo committed to.
+          const memoBody = writeInput.chapterMemo?.body ?? "";
+          const ledgerIssues = memoBody
+            ? validateHookLedger(memoBody, content)
+            : [];
+          return [...baseIssues, ...ledgerIssues];
+        },
+        maxReviewIterations: this.config.writingReviewRetries,
+        logWarn: (message) => this.logWarn(pipelineLang, message),
+        logStage: (message) => this.logStage(stageLanguage, message),
+      });
+      totalUsage = reviewResult.totalUsage;
+      finalContent = reviewResult.finalContent;
+      finalWordCount = reviewResult.finalWordCount;
+      revised = reviewResult.revised;
+      auditResult = reviewResult.auditResult;
+      postReviseCount = reviewResult.postReviseCount;
+      normalizeApplied = reviewResult.normalizeApplied;
+      preAuditNormalizedWordCount = reviewResult.preAuditNormalizedWordCount;
+    }
+
+    // 3b. Lightweight per-chapter promotion pass — check if any hooks should
+    // be promoted based on advanced_count derived from chapter_summaries.
+    // Runs BEFORE persistence so the reviewer of the NEXT chapter sees the
+    // updated ledger. No LLM calls — pure ledger parse + threshold check.
+    {
+      const { rerunPromotionPass } = await import("../utils/hook-promotion.js");
+      const { parsePendingHooksMarkdown, renderHookSnapshot } = await import("../utils/story-markdown.js");
+      const promotionStoryDir = join(bookDir, "story");
+      const ledgerPath = join(promotionStoryDir, "pending_hooks.md");
+      const ledgerRaw = await readFile(ledgerPath, "utf-8").catch(() => "");
+      if (ledgerRaw.trim()) {
+        const hooks = parsePendingHooksMarkdown(ledgerRaw);
+        if (hooks.length > 0) {
+          const summariesRaw = await readFile(join(promotionStoryDir, "chapter_summaries.md"), "utf-8").catch(() => "");
+          const promotionResult = rerunPromotionPass(hooks, summariesRaw);
+          if (promotionResult.updated) {
+            const ledgerLang: "zh" | "en" = /[\u4e00-\u9fff]/.test(ledgerRaw) ? "zh" : "en";
+            await writeFile(ledgerPath, renderHookSnapshot([...promotionResult.hooks], ledgerLang), "utf-8");
+            this.config.logger?.info(`[promotion] ${promotionResult.flippedCount} hook(s) promoted after chapter ${chapterNumber}`);
+          }
+        }
+      }
+    }
 
     // 4. Save the final chapter and truth files from a single persistence source
     this.logStage(stageLanguage, { zh: "落盘最终章节", en: "persisting final chapter" });
@@ -1327,7 +1847,7 @@ export class PipelineRunner {
     const lengthTelemetry = this.buildLengthTelemetry({
       lengthSpec,
       writerCount,
-      postWriterNormalizeCount: reviewResult.preAuditNormalizedWordCount,
+      postWriterNormalizeCount: preAuditNormalizedWordCount,
       postReviseCount,
       finalCount: finalWordCount,
       normalizeApplied,
@@ -1338,10 +1858,13 @@ export class PipelineRunner {
     // 4.1 Validate settler output before writing
     this.logStage(stageLanguage, { zh: "校验真相文件变更", en: "validating truth file updates" });
     const storyDir = join(bookDir, "story");
-    const [oldState, oldHooks, oldLedger] = await Promise.all([
+    const [oldState, oldHooks, oldLedger, authorityStoryFrame, authorityBookRules, authorityChapterSummaries] = await Promise.all([
       readFile(join(storyDir, "current_state.md"), "utf-8").catch(() => ""),
       readFile(join(storyDir, "pending_hooks.md"), "utf-8").catch(() => ""),
       readFile(join(storyDir, "particle_ledger.md"), "utf-8").catch(() => ""),
+      readStoryFrame(bookDir).catch(() => ""),
+      readFile(join(storyDir, "book_rules.md"), "utf-8").catch(() => ""),
+      readFile(join(storyDir, "chapter_summaries.md"), "utf-8").catch(() => ""),
     ]);
     const validator = new StateValidatorAgent(this.agentCtxFor("state-validator", bookId));
     const truthValidation = await validateChapterTruthPersistence({
@@ -1358,6 +1881,11 @@ export class PipelineRunner {
         oldState,
         oldHooks,
         oldLedger,
+      },
+      authorityContext: {
+        storyFrame: authorityStoryFrame,
+        bookRules: authorityBookRules,
+        chapterSummaries: authorityChapterSummaries,
       },
       reducedControlInput,
       language: pipelineLang,
@@ -1758,8 +2286,9 @@ export class PipelineRunner {
    * Also saves the statistical style_profile.json.
    */
   async generateStyleGuide(bookId: string, referenceText: string, sourceName?: string): Promise<string> {
-    if (referenceText.length < 500) {
-      throw new Error(`Reference text too short (${referenceText.length} chars, minimum 500). Provide at least 2000 chars for reliable style extraction.`);
+    const sample = referenceText.trim();
+    if (!sample) {
+      throw new Error("Reference text is required for style extraction.");
     }
 
     const { analyzeStyle } = await import("../agents/style-analyzer.js");
@@ -1767,15 +2296,55 @@ export class PipelineRunner {
     const storyDir = join(bookDir, "story");
     await mkdir(storyDir, { recursive: true });
 
-    // Statistical fingerprint
-    const profile = analyzeStyle(referenceText, sourceName);
+    const book = await this.state.loadBookConfig(bookId);
+    const { profile: gp } = await this.loadGenreProfile(book.genre);
+    const lang = (book.language ?? gp.language) === "en" ? "en" as const : "zh" as const;
+
+    // Statistical fingerprint (language-aware: words for en, characters for zh)
+    const profile = analyzeStyle(sample, sourceName, lang);
     await writeFile(join(storyDir, "style_profile.json"), JSON.stringify(profile, null, 2), "utf-8");
 
-    // LLM qualitative extraction
-    const response = await chatCompletion(this.config.client, this.config.model, [
-      {
-        role: "system",
-        content: `你是一位文学风格分析专家。分析参考文本的写作风格，提取可供模仿的定性特征。
+    let qualitativeGuide: string;
+    if (sample.length < 500) {
+      qualitativeGuide = this.buildDeterministicStyleGuide(profile, {
+        language: lang,
+        reason: lang === "en"
+          ? `The sample is short (${sample.length} chars), so this guide uses the statistical fingerprint instead of LLM qualitative extraction.`
+          : `样本文本较短（${sample.length}字），本次先使用统计指纹生成文风指南，不强行调用 LLM 做定性拆解。`,
+      });
+    } else {
+      try {
+        // LLM qualitative extraction (language-aware prompt)
+        const styleSystemPrompt = lang === "en"
+          ? `You are a literary style analyst. Analyze the writing style of the reference text and extract qualitative, imitable features.
+
+Output format (Markdown):
+## Narrative Voice & Tone
+(detached / fervent / ironic / warm / ..., with 1-2 quoted lines from the text)
+
+## Dialogue Style
+(shared traits in how characters speak: sentence length, verbal tics, dialect markers, dialogue rhythm)
+
+## Scene Description
+(sensory preferences, choice of imagery, description density, how setting ties to emotion)
+
+## Transitions & Connective Technique
+(how scenes switch, how time jumps are handled, paragraph-to-paragraph transitions)
+
+## Pacing
+(distribution of long vs short sentences, paragraph-length preference, how climaxes and lulls alternate)
+
+## Diction
+(signature high-frequency word choices, figurative/rhetorical tendencies, degree of colloquialism)
+
+## Emotional Expression
+(direct lyricism vs externalized action, frequency and style of interior monologue)
+
+## Distinctive Habits
+(any personal writing habits worth imitating)
+
+Base the analysis on the text's actual features, not generalities. Support each section with 1-2 quoted lines from the original.`
+          : `你是一位文学风格分析专家。分析参考文本的写作风格，提取可供模仿的定性特征。
 
 输出格式（Markdown）：
 ## 叙事声音与语气
@@ -1802,16 +2371,91 @@ export class PipelineRunner {
 ## 独特习惯
 （任何值得模仿的个人写作习惯）
 
-分析必须基于原文实际特征，不要泛泛而谈。每个部分用1-2个原文例句佐证。`,
-      },
-      {
-        role: "user",
-        content: `分析以下参考文本的写作风格：\n\n${referenceText.slice(0, 20000)}`,
-      },
-    ], { temperature: 0.3, maxTokens: 4096 });
+分析必须基于原文实际特征，不要泛泛而谈。每个部分用1-2个原文例句佐证。`;
+        const styleUserPrompt = lang === "en"
+          ? `Analyze the writing style of the following reference text:\n\n${sample}`
+          : `分析以下参考文本的写作风格：\n\n${sample}`;
+        const response = await chatCompletion(this.config.client, this.config.model, [
+          { role: "system", content: styleSystemPrompt },
+          { role: "user", content: styleUserPrompt },
+        ], { temperature: 0.3 });
+        qualitativeGuide = response.content.trim()
+          ? response.content
+          : this.buildDeterministicStyleGuide(profile, {
+              language: lang,
+              reason: lang === "en"
+                ? "The LLM returned empty style analysis; using the statistical fingerprint fallback."
+                : "LLM 未返回有效文风分析，本次使用统计指纹兜底生成文风指南。",
+            });
+      } catch (error) {
+        qualitativeGuide = this.buildDeterministicStyleGuide(profile, {
+          language: lang,
+          reason: lang === "en"
+            ? `LLM qualitative extraction failed: ${error instanceof Error ? error.message : String(error)}. Using the statistical fingerprint fallback.`
+            : `LLM 定性拆解失败：${error instanceof Error ? error.message : String(error)}。本次使用统计指纹兜底生成文风指南。`,
+        });
+      }
+    }
 
-    await writeFile(join(storyDir, "style_guide.md"), response.content, "utf-8");
-    return response.content;
+    const craftMethodology = buildWritingMethodologySection(lang);
+    const fullStyleGuide = `${qualitativeGuide}\n\n${craftMethodology}`;
+    await writeFile(join(storyDir, "style_guide.md"), fullStyleGuide, "utf-8");
+    return fullStyleGuide;
+  }
+
+  private buildDeterministicStyleGuide(
+    profile: {
+      readonly avgSentenceLength: number;
+      readonly sentenceLengthStdDev: number;
+      readonly avgParagraphLength: number;
+      readonly vocabularyDiversity: number;
+      readonly topPatterns: ReadonlyArray<string>;
+      readonly rhetoricalFeatures: ReadonlyArray<string>;
+      readonly sourceName?: string;
+    },
+    options: { readonly language: "zh" | "en"; readonly reason: string },
+  ): string {
+    if (options.language === "en") {
+      return [
+        "# Style Guide",
+        "",
+        `> ${options.reason}`,
+        "",
+        "## Statistical Fingerprint",
+        `- Source: ${profile.sourceName ?? "unknown"}`,
+        `- Average sentence length: ${profile.avgSentenceLength}`,
+        `- Sentence length variance: ${profile.sentenceLengthStdDev}`,
+        `- Average paragraph length: ${profile.avgParagraphLength}`,
+        `- Vocabulary diversity: ${Math.round(profile.vocabularyDiversity * 100)}%`,
+        profile.topPatterns.length > 0 ? `- Repeated openings: ${profile.topPatterns.join(", ")}` : "- Repeated openings: none obvious in this sample",
+        profile.rhetoricalFeatures.length > 0 ? `- Rhetorical features: ${profile.rhetoricalFeatures.join(", ")}` : "- Rhetorical features: none obvious in this sample",
+        "",
+        "## How To Use",
+        "- Treat this as a lightweight style fingerprint, not a full imitation bible.",
+        "- Keep sentence and paragraph rhythm close to the sample when drafting.",
+        "- If this guide feels too thin, import a longer excerpt later; the file will be replaced.",
+      ].join("\n");
+    }
+
+    return [
+      "# 文风指南",
+      "",
+      `> ${options.reason}`,
+      "",
+      "## 统计风格指纹",
+      `- 来源：${profile.sourceName ?? "unknown"}`,
+      `- 平均句长：${profile.avgSentenceLength}`,
+      `- 句长波动：${profile.sentenceLengthStdDev}`,
+      `- 平均段落长度：${profile.avgParagraphLength}`,
+      `- 词汇多样性：${Math.round(profile.vocabularyDiversity * 100)}%`,
+      profile.topPatterns.length > 0 ? `- 高频句首/模式：${profile.topPatterns.join("、")}` : "- 高频句首/模式：样本内不明显",
+      profile.rhetoricalFeatures.length > 0 ? `- 修辞特征：${profile.rhetoricalFeatures.join("、")}` : "- 修辞特征：样本内不明显",
+      "",
+      "## 使用方式",
+      "- 这是一份轻量文风指纹，不是完整仿写圣经。",
+      "- 后续写作优先参考句长、段落长度、节奏波动和可见修辞。",
+      "- 如果想得到更稳定的定性拆解，后续可以导入更长片段覆盖本文件。",
+    ].join("\n");
   }
 
   /**
@@ -1839,9 +2483,16 @@ export class PipelineRunner {
 
     const parentBook = await this.state.loadBookConfig(parentBookId);
 
+    // Phase 5: parent book may be on the new prose layout; prefer outline/.
+    const readParentOutline = async (newRel: string, legacyRel: string): Promise<string> => {
+      const preferred = await readSafe(join(parentDir, "story", newRel));
+      if (preferred.trim() && preferred !== "(无)") return preferred;
+      return readSafe(join(parentDir, "story", legacyRel));
+    };
+
     const [storyBible, currentState, ledger, hooks, summaries, subplots, emotions, matrix] =
       await Promise.all([
-        readSafe(join(parentDir, "story/story_bible.md")),
+        readParentOutline("outline/story_frame.md", "story_bible.md"),
         readSafe(join(parentDir, "story/current_state.md")),
         readSafe(join(parentDir, "story/particle_ledger.md")),
         readSafe(join(parentDir, "story/pending_hooks.md")),
@@ -1930,7 +2581,7 @@ ${emotions}
 ## 正传角色矩阵
 ${matrix}`,
       },
-    ], { temperature: 0.3, maxTokens: 16384 });
+    ], { temperature: 0.3 });
 
     // Append deterministic meta block (LLM may hallucinate timestamps)
     const metaBlock = [
@@ -1984,7 +2635,7 @@ ${matrix}`,
    * Import existing chapters into a book. Reverse-engineers all truth files
    * via sequential replay so the Writer and Auditor can continue naturally.
    *
-   * Step 1: Generate foundation (story_bible, volume_outline, book_rules) from all chapters.
+   * Step 1: Generate foundation (story_frame, volume_map, book_rules) from all chapters.
    * Step 2: Sequentially replay each chapter through ChapterAnalyzer to build truth files.
    */
   async importChapters(input: ImportChaptersInput): Promise<ImportChaptersResult> {
@@ -2005,23 +2656,20 @@ ${matrix}`,
           zh: `步骤 1：从 ${input.chapters.length} 章生成基础设定...`,
           en: `Step 1: Generating foundation from ${input.chapters.length} chapters...`,
         }));
-        const allText = input.chapters.map((c, i) =>
-          resolvedLanguage === "en"
-            ? `Chapter ${i + 1}: ${c.title}\n\n${c.content}`
-            : `第${i + 1}章 ${c.title}\n\n${c.content}`,
-        ).join("\n\n---\n\n");
+        const foundationSource = buildImportFoundationSource(input.chapters, resolvedLanguage);
 
         const architect = new ArchitectAgent(this.agentCtxFor("architect", input.bookId));
         const isSeries = input.importMode === "series";
         const foundation = isSeries
           ? await this.generateAndReviewFoundation({
-              generate: (reviewFeedback) => architect.generateFoundationFromImport(book, allText, undefined, reviewFeedback, { importMode: "series" }),
+              generate: (reviewFeedback) => architect.generateFoundationFromImport(book, foundationSource, undefined, reviewFeedback, { importMode: "series" }),
               reviewer: new FoundationReviewerAgent(this.agentCtxFor("foundation-reviewer", input.bookId)),
               mode: "series",
               language: resolvedLanguage === "en" ? "en" : "zh",
               stageLanguage: resolvedLanguage,
+              targetChapters: book.targetChapters,
             })
-          : await architect.generateFoundationFromImport(book, allText);
+          : await architect.generateFoundationFromImport(book, foundationSource);
         await architect.writeFoundationFiles(
           bookDir,
           foundation,
@@ -2033,12 +2681,12 @@ ${matrix}`,
         await this.state.snapshotState(input.bookId, 0);
 
         // Generate style guide from imported chapters
-        if (allText.length >= 500) {
+        if (foundationSource.length >= 500) {
           log?.info(this.localize(resolvedLanguage, {
             zh: "提取原文风格指纹...",
             en: "Extracting source style fingerprint...",
           }));
-          await this.tryGenerateStyleGuide(input.bookId, allText, book.title, resolvedLanguage);
+          await this.tryGenerateStyleGuide(input.bookId, foundationSource, book.title, resolvedLanguage);
         }
 
         log?.info(this.localize(resolvedLanguage, {
@@ -2080,12 +2728,17 @@ ${matrix}`,
           ruleStack: governedInput.ruleStack,
         });
 
-        // Save chapter file + core truth files (state, ledger, hooks)
-        await writer.saveChapter(bookDir, {
+        const chapterWordCount = countChapterLength(ch.content, countingMode);
+        const persistedOutput: WriteChapterOutput = {
           ...output,
+          content: ch.content,
+          wordCount: chapterWordCount,
           postWriteErrors: [],
           postWriteWarnings: [],
-        }, gp.numericalSystem, resolvedLanguage);
+        };
+
+        // Save chapter file + core truth files (state, ledger, hooks)
+        await writer.saveChapter(bookDir, persistedOutput, gp.numericalSystem, resolvedLanguage);
 
         // Save extended truth files (summaries, subplots, emotional arcs, character matrix)
         await writer.saveNewTruthFiles(bookDir, {
@@ -2099,7 +2752,6 @@ ${matrix}`,
         // Update chapter index
         const existingIndex = await this.state.loadChapterIndex(input.bookId);
         const now = new Date().toISOString();
-        const chapterWordCount = countChapterLength(ch.content, countingMode);
         const newEntry: ChapterMeta = {
           number: chapterNumber,
           title: output.title,
@@ -2220,7 +2872,7 @@ ${matrix}`,
     bookDir: string,
     chapterNumber: number,
     externalContext?: string,
-  ): Promise<Pick<WriteChapterInput, "externalContext" | "chapterIntent" | "contextPackage" | "ruleStack" | "trace">> {
+  ): Promise<Pick<WriteChapterInput, "externalContext" | "chapterIntent" | "chapterMemo" | "chapterIntentData" | "contextPackage" | "ruleStack">> {
     if ((this.config.inputGovernanceMode ?? "v2") === "legacy") {
       return { externalContext };
     }
@@ -2234,10 +2886,12 @@ ${matrix}`,
     );
 
     return {
+      externalContext,
       chapterIntent: plan.intentMarkdown,
+      chapterMemo: plan.memo,
+      chapterIntentData: plan.intent,
       contextPackage: composed.contextPackage,
       ruleStack: composed.ruleStack,
-      trace: composed.trace,
     };
   }
 
@@ -2342,7 +2996,7 @@ ${matrix}`,
       params.chapterContent,
       params.lengthSpec.countingMode,
     );
-    if (!isOutsideSoftRange(writerCount, params.lengthSpec)) {
+    if (!isOutsideHardRange(writerCount, params.lengthSpec)) {
       return {
         content: params.chapterContent,
         wordCount: writerCount,
@@ -2800,6 +3454,7 @@ ${matrix}`,
     auditOptions?: {
       temperature?: number;
       chapterIntent?: string;
+      chapterMemo?: ChapterMemo;
       contextPackage?: ContextPackage;
       ruleStack?: RuleStack;
       truthFileOverrides?: {
@@ -2875,16 +3530,19 @@ ${matrix}`,
     },
   ): Promise<{
     plan: PlanChapterOutput;
-    composed: Awaited<ReturnType<ComposerAgent["composeChapter"]>>;
+    composed: ComposeChapterOutput;
   }> {
     const plan = await this.resolveGovernedPlan(book, bookDir, chapterNumber, externalContext, options);
-
-    const composer = new ComposerAgent(this.agentCtxFor("composer", book.id));
-    const composed = await composer.composeChapter({
+    const composerCtx = this.agentCtxFor("composer", book.id);
+    const composer = new ComposerAgent(composerCtx);
+    const composed = await composeGovernedChapter({
       book,
       bookDir,
       chapterNumber,
       plan,
+      contextBudget: contextBudgetFromClient(composerCtx.client),
+      compressibleContextCompiler: (request) => composer.compileCompressibleContext(request),
+      onContextCompression: this.config.onContextCompression,
     });
 
     return { plan, composed };
@@ -2908,12 +3566,16 @@ ${matrix}`,
     }
 
     const planner = new PlannerAgent(this.agentCtxFor("planner", book.id));
-    return planner.planChapter({
+    const plan = await planner.planChapter({
       book,
       bookDir,
       chapterNumber,
       externalContext,
     });
+    // Persist in the new memo format so subsequent compose/write phases can
+    // skip the planner LLM call when no new context is supplied.
+    await savePersistedPlan(bookDir, plan);
+    return plan;
   }
 
   private async emitWebhook(

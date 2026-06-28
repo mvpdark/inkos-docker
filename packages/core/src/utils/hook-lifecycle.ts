@@ -1,4 +1,5 @@
 import type { HookPayoffTiming } from "../models/runtime-state.js";
+import type { StoredHook } from "../state/memory-db.js";
 import {
   HOOK_ACTIVITY_THRESHOLDS,
   HOOK_PHASE_THRESHOLDS,
@@ -7,6 +8,60 @@ import {
   HOOK_TIMING_PROFILES,
   type HookPhase,
 } from "./hook-policy.js";
+
+export const DEFAULT_HOOK_LOOKAHEAD_CHAPTERS = 3;
+
+export function normalizeStoredHookStatus(status: string): "resolved" | "deferred" | "progressing" | "open" {
+  if (/^(resolved|closed|done|已回收|已解决)$/i.test(status.trim())) return "resolved";
+  if (/^(deferred|paused|hold|dormant|sleeping|延后|延期|搁置|暂缓|未开启|待开启|未启动|待启动|待推进)$/i.test(status.trim())) return "deferred";
+  if (/^(progressing|advanced|重大推进|持续推进)$/i.test(status.trim())) return "progressing";
+  return "open";
+}
+
+export function filterActiveHooks(hooks: ReadonlyArray<StoredHook>): StoredHook[] {
+  return hooks.filter((hook) => {
+    const status = normalizeStoredHookStatus(hook.status);
+    if (status === "resolved" || status === "deferred") return false;
+    // promoted=false means this is still an architect seed, not live hook debt.
+    // Legacy rows without the promoted column keep the old behavior.
+    return hook.promoted !== false;
+  });
+}
+
+export function isFuturePlannedHook(
+  hook: StoredHook,
+  chapterNumber: number,
+  lookahead: number = DEFAULT_HOOK_LOOKAHEAD_CHAPTERS,
+): boolean {
+  return hook.lastAdvancedChapter <= 0 && hook.startChapter > chapterNumber + lookahead;
+}
+
+export function isHookWithinChapterWindow(
+  hook: StoredHook,
+  chapterNumber: number,
+  recentWindow: number = 5,
+  lookahead: number = DEFAULT_HOOK_LOOKAHEAD_CHAPTERS,
+): boolean {
+  const recentCutoff = Math.max(0, chapterNumber - recentWindow);
+
+  if (hook.lastAdvancedChapter > 0 && hook.lastAdvancedChapter >= recentCutoff) {
+    return true;
+  }
+
+  if (hook.lastAdvancedChapter > 0) {
+    return false;
+  }
+
+  if (hook.startChapter <= 0) {
+    return true;
+  }
+
+  if (hook.startChapter >= recentCutoff && hook.startChapter <= chapterNumber) {
+    return true;
+  }
+
+  return hook.startChapter > chapterNumber && hook.startChapter <= chapterNumber + lookahead;
+}
 
 const LABELS: Record<"zh" | "en", Record<HookPayoffTiming, string>> = {
   en: {

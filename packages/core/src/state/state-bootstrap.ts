@@ -7,6 +7,7 @@ import {
   StateManifestSchema,
   type ChapterSummariesState,
   type CurrentStateState,
+  type HooksState,
   type HookStatus,
   type StateManifest,
 } from "../models/runtime-state.js";
@@ -20,6 +21,7 @@ import {
   parseChapterSummariesMarkdown,
   parseInteger,
   parseMarkdownTableRows,
+  parsePendingHooksMarkdown,
 } from "../utils/story-markdown.js";
 
 export {
@@ -216,14 +218,16 @@ async function loadOrBootstrapHooks(params: {
   readonly forceBootstrapFromMarkdown?: boolean;
 }) {
   if (!params.forceBootstrapFromMarkdown) {
-    const existing = await loadJsonIfValid(
+    const existing = await loadHooksStateIfValid(
       params.statePath,
-      HooksStateSchema,
       params.warnings,
       "hooks.json",
     );
     if (existing) {
-      return existing;
+      if (existing.repaired) {
+        await writeFile(params.statePath, JSON.stringify(existing.state, null, 2), "utf-8");
+      }
+      return existing.state;
     }
   }
 
@@ -276,27 +280,14 @@ async function loadOrBootstrapSummaries(params: {
 }
 
 function parsePendingHooksStateMarkdown(markdown: string, warnings: string[]) {
-  const tableRows = parseMarkdownTableRows(markdown)
-    .filter((row) => (row[0] ?? "").toLowerCase() !== "hook_id");
-
-  if (tableRows.length > 0) {
+  const parsedHooks = parsePendingHooksMarkdown(markdown);
+  if (parsedHooks.length > 0) {
     return HooksStateSchema.parse({
-      hooks: tableRows
-        .filter((row) => normalizeHookId(row[0]).length > 0)
-        .map((row) => {
-          const hookId = normalizeHookId(row[0]);
-          const legacyShape = row.length < 8;
-          return {
-            hookId,
-            startChapter: parseStrictIntegerWithWarning(row[1], warnings, `${hookId}:startChapter`),
-            type: row[2] ?? "unspecified",
-            status: normalizeHookStatus(row[3], warnings, hookId),
-            lastAdvancedChapter: parseStrictIntegerWithWarning(row[4], warnings, `${hookId}:lastAdvancedChapter`),
-            expectedPayoff: row[5] ?? "",
-            payoffTiming: legacyShape ? undefined : normalizeHookPayoffTiming(row[6]),
-            notes: legacyShape ? (row[6] ?? "") : (row[7] ?? ""),
-          };
-        }),
+      hooks: parsedHooks.map((hook) => ({
+        ...hook,
+        type: normalizeHookType(hook.type, warnings, hook.hookId),
+        status: normalizeHookStatus(hook.status, warnings, hook.hookId),
+      })),
     });
   }
 
@@ -417,6 +408,64 @@ async function loadJsonIfValid<T>(
   }
 }
 
+async function loadHooksStateIfValid(
+  path: string,
+  warnings: string[],
+  fileLabel: string,
+): Promise<{ readonly state: HooksState; readonly repaired: boolean } | null> {
+  try {
+    const raw = await readFile(path, "utf-8");
+    const repaired = repairHooksStateInput(JSON.parse(raw), warnings);
+    return {
+      state: HooksStateSchema.parse(repaired.value),
+      repaired: repaired.changed,
+    };
+  } catch (error) {
+    const message = String(error);
+    if (!/ENOENT/.test(message)) {
+      appendWarning(warnings, `${fileLabel} invalid, rebuilt from markdown`);
+    }
+    return null;
+  }
+}
+
+function repairHooksStateInput(value: unknown, warnings: string[]): { readonly value: unknown; readonly changed: boolean } {
+  if (!isRecord(value) || !Array.isArray(value.hooks)) {
+    return { value, changed: false };
+  }
+
+  let changed = false;
+  const hooks = value.hooks.map((hook, index) => {
+    if (!isRecord(hook)) return hook;
+    const hookId = typeof hook.hookId === "string" && hook.hookId.trim()
+      ? hook.hookId.trim()
+      : `hooks[${index}]`;
+    if (typeof hook.type === "string" && hook.type.trim().length > 0) {
+      if (hook.type === hook.type.trim()) {
+        return hook;
+      }
+      changed = true;
+      return { ...hook, type: hook.type.trim() };
+    }
+
+    changed = true;
+    appendWarning(warnings, `${hookId}: empty hook type normalized to "unspecified"`);
+    return {
+      ...hook,
+      type: "unspecified",
+    };
+  });
+
+  return {
+    value: changed ? { ...value, hooks } : value,
+    changed,
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 async function loadMarkdownBootstrapState(params: {
   readonly bookDir: string;
   readonly storyDir: string;
@@ -528,12 +577,19 @@ export function resolveContiguousChapterPrefix(chapterNumbers: ReadonlyArray<num
 function normalizeHookStatus(value: string | undefined, warnings: string[], hookId: string): HookStatus {
   const normalized = (value ?? "").trim().toLowerCase();
   if (!normalized) return "open";
-  if (/(resolved|closed|done|已回收|回收|完成)/i.test(normalized)) return "resolved";
-  if (/(deferred|paused|hold|搁置|延后|延期)/i.test(normalized)) return "deferred";
-  if (/(progress|active|推进|进行中)/i.test(normalized)) return "progressing";
-  if (/(open|pending|待定|未回收)/i.test(normalized)) return "open";
+  if (/(resolved|closed|done|paid[_ -]?off|已回收|回收|完成|已解决|已兑现|兑现)/i.test(normalized)) return "resolved";
+  if (/(deferred|paused|hold|dormant|inactive|unplanted|unseeded|not[_ -]?started|not[_ -]?active|搁置|延后|延期|暂缓|休眠|未激活|未启动|待启动|未推进|尚未推进)/i.test(normalized)) return "deferred";
+  if (/(confirmed[_ -]?hit|confirmed|advanced|progressing|progress|active|pressured|命中|已确认命中|已推进|推进|进行中|持续推进|重大推进)/i.test(normalized)) return "progressing";
+  if (/(open|pending|seeded|planted|待定|未回收|已埋|已种下|已铺垫)/i.test(normalized)) return "open";
   appendWarning(warnings, `${hookId}:status normalized from "${value ?? ""}" to "open"`);
   return "open";
+}
+
+function normalizeHookType(value: string | undefined, warnings: string[], hookId: string): string {
+  const normalized = (value ?? "").trim();
+  if (normalized) return normalized;
+  appendWarning(warnings, `${hookId}: empty hook type normalized to "unspecified"`);
+  return "unspecified";
 }
 
 function parseStrictIntegerWithWarning(value: string | undefined, warnings: string[], fieldLabel: string): number {
