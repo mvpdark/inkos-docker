@@ -4,6 +4,12 @@ on:
   workflow_dispatch:
   schedule:
     - cron: "0 3 * * *"
+  push:
+    branches: [master]
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - .github/workflows/build-inkos-image.yml
 
 permissions:
   contents: read
@@ -71,8 +77,10 @@ jobs:
         with:
           context: .
           push: true
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           build-args: |
             INKOS_VERSION=${{ steps.npm_version.outputs.version }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
