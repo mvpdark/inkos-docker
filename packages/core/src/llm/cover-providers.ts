@@ -1,4 +1,4 @@
-export type CoverProviderId = "kkaiapi" | "openai" | "google";
+export type CoverProviderId = "yunwu" | "openai" | "google" | "xai";
 
 export interface CoverProviderPreset {
   readonly service: CoverProviderId;
@@ -11,9 +11,9 @@ export interface CoverProviderPreset {
 
 export const COVER_PROVIDER_PRESETS: readonly CoverProviderPreset[] = [
   {
-    service: "kkaiapi",
-    label: "kkaiapi",
-    baseUrl: "https://api.kkaiapi.com/v1",
+    service: "yunwu",
+    label: "yunwu",
+    baseUrl: "https://yunwu.ai/v1",
     api: "images",
     defaultModel: "gpt-image-2",
     models: ["gpt-image-2"],
@@ -33,6 +33,14 @@ export const COVER_PROVIDER_PRESETS: readonly CoverProviderPreset[] = [
     api: "gemini",
     defaultModel: "gemini-3.1-flash-image-preview",
     models: ["gemini-3.1-flash-image-preview", "gemini-2.5-flash-image"],
+  },
+  {
+    service: "xai",
+    label: "xAI (Grok Imagine)",
+    baseUrl: "https://api.x.ai/v1",
+    api: "images",
+    defaultModel: "grok-imagine-image",
+    models: ["grok-imagine-image", "grok-imagine-image-quality"],
   },
 ];
 

@@ -154,7 +154,7 @@ function compareServiceListItems(
   left: { readonly service: string },
   right: { readonly service: string },
 ): number {
-  const priority = ["kkaiapi", "openrouter", "newapi", "siliconcloud"];
+  const priority = ["yunwu", "openrouter", "newapi", "siliconcloud"];
   const leftPriority = priority.indexOf(left.service);
   const rightPriority = priority.indexOf(right.service);
   if (leftPriority !== -1 || rightPriority !== -1) {
@@ -2668,7 +2668,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     // for the Play auto-illustration toggles.
     const envConfigured = Boolean(
       (process.env.INKOS_COVER_BASE_URL || process.env.INKOS_COVER_ENDPOINT)
-      && (process.env.INKOS_COVER_API_KEY || keyFor("kkaiapi")),
+      && (process.env.INKOS_COVER_API_KEY || keyFor("yunwu")),
     );
     const configured = Boolean(cover?.service && keyFor(cover.service)) || envConfigured;
     return c.json({

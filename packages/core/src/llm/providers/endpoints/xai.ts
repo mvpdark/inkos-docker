@@ -19,6 +19,7 @@ export const XAI: InkosEndpoint = {
   defaultTemperature: 1,
   writingTemperature: 1,
   models: [
+    { id: "grok-4.3", maxOutput: 4096, contextWindowTokens: 2000000, enabled: true, releasedAt: "2026-04-30" },
     { id: "grok-4.20-beta-0309-reasoning", maxOutput: 4096, contextWindowTokens: 2000000, enabled: true, releasedAt: "2026-03-09" },
     { id: "grok-4.20-beta-0309-non-reasoning", maxOutput: 4096, contextWindowTokens: 2000000, enabled: true, releasedAt: "2026-03-09" },
     { id: "grok-4.20-multi-agent-beta-0309", maxOutput: 4096, contextWindowTokens: 2000000, enabled: true, releasedAt: "2026-03-09" },
